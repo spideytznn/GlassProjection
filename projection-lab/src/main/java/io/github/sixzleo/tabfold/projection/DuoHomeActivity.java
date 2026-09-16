@@ -24,6 +24,15 @@ public class DuoHomeActivity extends Activity {
     private static final int TEXT=HomeStyle.TEXT,MUTED=HomeStyle.MUTED,ACCENT=HomeStyle.ACCENT;
     static volatile boolean foreground;
     private static final Map<Integer,DuoHomeActivity> panelActivities=new HashMap<>();
+    private static final List<DuoHomeActivity> homeInstances=new ArrayList<>();
+    /** Re-attach status bars for resumed panels; called on accessibility connect or when mirrors stack. */
+    static void refreshShadeBars(){for(DuoHomeActivity a:new ArrayList<>(homeInstances))if(a.shadeAlive())ProjectionService.updateShadeBar(a);}
+    boolean shadeAlive(){return resumed&&!isDestroyed();}
+    static List<DuoHomeActivity> instancesSnapshot(){return new ArrayList<>(homeInstances);}
+    HomeStore store(){return store;}
+    HomeWidgets homeWidgets(){return widgets;}
+    /** Replace the whole layout after a migration import and redraw. */
+    void applyMigratedLayout(HomeLayout imported){layout=imported;save();render();}
     static boolean barePanel(int displayId){DuoHomeActivity a=panelActivities.get(displayId);if(a==null||!a.resumed||!a.hasWindowFocus()||a.editing||a.showWidgets||a.dialogs.stream().anyMatch(Dialog::isShowing))return false;WindowInsets insets=a.getWindow().getDecorView().getRootWindowInsets();return insets==null||!insets.isVisible(WindowInsets.Type.ime());}
 
     private boolean resumed;
@@ -48,6 +57,23 @@ public class DuoHomeActivity extends Activity {
     private int widgetScrollY;
     private TextView loadLabel;
     private final List<Dialog> dialogs=new ArrayList<>();
+    /** Debug hook so adb can drive the shade and the migration on any display. */
+    private final BroadcastReceiver shadeDebug=new BroadcastReceiver(){
+        public void onReceive(Context context,Intent intent){
+            String action=intent.getAction();
+            if(action==null)return;
+            if(action.endsWith(".MIGRATE_SCAN")||action.endsWith(".MIGRATE_APPLY")){
+                // Migration must run exactly once; a second bind flow cancels the
+                // first one's pending widget and closes the user's confirm dialog.
+                android.view.Display display=getDisplay();
+                if(display==null||display.getDisplayId()!=0)return;
+                if(action.endsWith(".MIGRATE_SCAN"))HomeMigrator.scanAsync(ProjectionService.instance);
+                else HomeMigrator.applyAsync(ProjectionService.instance,intent.getStringExtra("layout"));
+                return;
+            }
+            openShade(intent.getIntExtra("side",HomeStatusBar.SIDE_NOTIFICATIONS));
+        }
+    };
     private final List<Runnable> catalogObservers=new ArrayList<>();
     private final LauncherApps.Callback appChanges=new LauncherApps.Callback(){
         public void onPackageRemoved(String p,UserHandle u){reload();}
@@ -73,7 +99,7 @@ public class DuoHomeActivity extends Activity {
     private int dp(float value){return Math.round(value*getResources().getDisplayMetrics().density);}
     private int widgetDp(int pixels){return Math.round(pixels/getResources().getDisplayMetrics().density);}
     @Override public void onCreate(Bundle saved){
-        super.onCreate(saved);if(dualPanel())panelActivities.put(getDisplay().getDisplayId(),this);store=new HomeStore(this,panelStore());layout=store.read();
+        super.onCreate(saved);homeInstances.add(this);if(dualPanel())panelActivities.put(getDisplay().getDisplayId(),this);store=new HomeStore(this,panelStore());layout=store.read();
         if(saved!=null){showWidgets=saved.getBoolean("widgets");editing=saved.getBoolean("editing");widgetScrollY=saved.getInt("scroll");}
         widgets=new HomeWidgets(this,store,()->{if(!isDestroyed()){
             layout=store.read();
@@ -87,13 +113,21 @@ public class DuoHomeActivity extends Activity {
         WindowInsetsController bars=getWindow().getInsetsController();
         if(bars!=null)bars.setSystemBarsAppearance(0,WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS|WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
         getSystemService(LauncherApps.class).registerCallback(appChanges,main);
+        IntentFilter shadeActions=new IntentFilter();
+        shadeActions.addAction(getPackageName()+".OPEN_SHADE");
+        shadeActions.addAction(getPackageName()+".MIGRATE_SCAN");
+        shadeActions.addAction(getPackageName()+".MIGRATE_APPLY");
+        registerReceiver(shadeDebug,shadeActions,Context.RECEIVER_EXPORTED);
         render();reload();
     }
     @Override protected void onStart(){super.onStart();widgets.start();}
     @Override protected void onResume(){super.onResume();if(wasAway){if(dualPanel())panelEntranceRequestedAt=SystemClock.uptimeMillis();else requestHomeEntrance();wasAway=false;}resumed=true;foreground=hasWindowFocus();ProjectionService.refreshHomeScope();animateEntranceIfRequested();
-        ProjectionService.updateShadeBar(this);}
+        ProjectionService.updateShadeBar(this);
+        // Bottom-edge up-swipes belong to the system home gesture; arriving home
+        // should fold an open shade away, mirroring the native shade behavior.
+        android.view.Display resumedDisplay=getDisplay();
+        if(resumedDisplay!=null)HomeControlPanel.closeIfOpen(resumedDisplay.getDisplayId());}
     @Override protected void onPause(){entrancePending=false;entranceRunning=false;if(root!=null){root.animate().cancel();root.setAlpha(1f);root.setScaleX(1f);root.setScaleY(1f);root.setTranslationY(0); }wasAway=true;touching=false;resumed=false;foreground=false;windowEntranceComplete=false;main.removeCallbacks(entranceFallback);ProjectionService.refreshHomeScope();
-        ProjectionService.removeShadeBar(this);
         save();super.onPause();}
     @Override public boolean dispatchTouchEvent(MotionEvent event){
         int action=event.getActionMasked();if(action==MotionEvent.ACTION_DOWN)touching=true;
@@ -102,9 +136,10 @@ public class DuoHomeActivity extends Activity {
     }
     @Override protected void onStop(){widgets.stop();super.onStop();}
     @Override protected void onDestroy(){
+        homeInstances.remove(this);
         if(dualPanel())panelActivities.remove(getDisplay().getDisplayId(),this);
         widgets.close();
-        ProjectionService.removeShadeBar(this);
+        try{unregisterReceiver(shadeDebug);}catch(IllegalArgumentException ignored){}
         getSystemService(LauncherApps.class).unregisterCallback(appChanges);loader.shutdownNow();main.removeCallbacksAndMessages(null);
         for(Dialog d:dialogs)if(d.isShowing())d.dismiss();dialogs.clear();super.onDestroy();
     }
@@ -123,7 +158,10 @@ public class DuoHomeActivity extends Activity {
         super.onActivityResult(request,result,data);if(widgets.result(request,result,data))return;
         if(request==4201){ProjectionService.refreshHomeScope();render();}
     }
-    void openShade(int side){new HomeControlPanel(this,side==HomeStatusBar.SIDE_CONTROL).show();}
+    void openShade(int side){
+        if(getDisplay()==null)return;
+        HomeControlPanel.open(getDisplay().getDisplayId(),side==HomeStatusBar.SIDE_CONTROL);
+    }
     private void reload(){
         if(isDestroyed()||loader.isShutdown())return;
         if(loading){reloadPending=true;return;}loading=true;
@@ -287,7 +325,7 @@ public class DuoHomeActivity extends Activity {
     private View appPage(int page){
         FrameLayout frame=new FrameLayout(this);
         FrameLayout scroll=new FrameLayout(this);scroll.setClipToPadding(false);frame.addView(scroll,new FrameLayout.LayoutParams(-1,-1));
-        GridLayout grid=new GridLayout(this);grid.setTag("home-app-grid");int cols=4;
+        GridLayout grid=new GridLayout(this);grid.setTag("home-app-grid");int cols=HomeLayout.COLUMNS;
         grid.setColumnCount(cols);grid.setAlignmentMode(GridLayout.ALIGN_BOUNDS);scroll.addView(grid,new FrameLayout.LayoutParams(-1,-2));
         scroll.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->fitAppRows(scroll,grid,cols));
         int count=0;
@@ -318,8 +356,8 @@ public class DuoHomeActivity extends Activity {
     }
     private void fitAppRows(View viewport,GridLayout grid,int columns){
         if(viewport.getHeight()<=0||grid.getChildCount()==0)return;
-        int rows=(HomeLayout.PAGE_SIZE+columns-1)/columns;
-        // The cell plus its two 2 dp margins must fit all four rows exactly.
+        int rows=HomeLayout.ROWS;
+        // The cell plus its two 2 dp margins must fit every row exactly.
         int cell=Math.max(1,Math.min(dp(wide?96:92),viewport.getHeight()/rows-dp(4)));
         for(int i=0;i<grid.getChildCount();i++){
             View child=grid.getChildAt(i);HomeLayout.Cell placement=(HomeLayout.Cell)child.getTag();

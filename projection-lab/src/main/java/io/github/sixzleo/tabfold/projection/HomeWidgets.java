@@ -35,6 +35,7 @@ final class HomeWidgets {
             List<Integer> latest=store.widgets();latest.remove(Integer.valueOf(id));ids.clear();ids.addAll(latest);store.widgets(latest);changed.run();}
     }
     void start(){try{host.startListening();}catch(RuntimeException e){message("小组件暂时无法更新，请重新打开桌面");}}
+    HomeStore store(){return store;}
     void stop(){host.stopListening();}
     void close(){dismissPicker();host.resetViews();views.clear();}
     AppWidgetHostView view(int id,AppWidgetProviderInfo info){
@@ -62,8 +63,9 @@ final class HomeWidgets {
         if(picker!=null){picker.dismiss();picker=null;}
         if(recoveryDialog!=null){AlertDialog dialog=recoveryDialog;recoveryDialog=null;dialog.dismiss();}
     }
-    private void bind(AppWidgetProviderInfo provider,int page){
-        if(!cancelPending())return;int id=host.allocateAppWidgetId();
+    /** Migration entry: runs the standard bind flow, opening the system confirmation. */
+    void addForMigration(AppWidgetProviderInfo provider,int page){bind(provider,page);}
+    private void bind(AppWidgetProviderInfo provider,int page){        if(!cancelPending())return;int id=host.allocateAppWidgetId();
         if(!store.beginWidget(id,page)){host.deleteAppWidgetId(id);message("无法保存组件位置，请稍后重试");return;}
         Bundle options=new Bundle();options.putInt(AppWidgetManager.OPTION_APPWIDGET_HOST_CATEGORY,AppWidgetProviderInfo.WIDGET_CATEGORY_HOME_SCREEN);
         try{
@@ -111,15 +113,15 @@ final class HomeWidgets {
         float density=activity.getResources().getDisplayMetrics().density;
         android.view.View grid=activity.getWindow().getDecorView().findViewWithTag("home-app-grid");
         android.view.View viewport=grid!=null&&grid.getParent() instanceof android.view.View?(android.view.View)grid.getParent():null;
-        float cellWidth=viewport!=null&&viewport.getWidth()>0?viewport.getWidth()/4f:80*density;
+        float cellWidth=viewport!=null&&viewport.getWidth()>0?viewport.getWidth()/(float)HomeLayout.COLUMNS:80*density;
         boolean wide=activity.getWindowManager().getCurrentWindowMetrics().getBounds().width()/density>=600;
         float rowPitch=(wide?100:96)*density;
-        float cellHeight=viewport!=null&&viewport.getHeight()>0?Math.min(rowPitch,viewport.getHeight()/4):rowPitch;
-        return new float[]{cellWidth,cellHeight,4*density};
+        float cellHeight=viewport!=null&&viewport.getHeight()>0?Math.min(rowPitch,viewport.getHeight()/(float)HomeLayout.ROWS):rowPitch;
+        return new float[]{cellWidth,cellHeight,(HomeLayout.COLUMNS)*density};
     }
     List<int[]> resizeChoices(AppWidgetProviderInfo info,HomeLayout.Item item){
         float[] geometry=gridGeometry();List<int[]> result=new ArrayList<>();
-        for(int y=1;y<=4;y++)for(int x=1;x<=4;x++){
+        for(int y=1;y<=HomeLayout.ROWS;y++)for(int x=1;x<=HomeLayout.COLUMNS;x++){
             if(HomeWidgetResize.allows(x,item.spanX,(info.resizeMode&AppWidgetProviderInfo.RESIZE_HORIZONTAL)!=0,info.minWidth,info.minResizeWidth,info.maxResizeWidth,geometry[0],geometry[2])
                 &&HomeWidgetResize.allows(y,item.spanY,(info.resizeMode&AppWidgetProviderInfo.RESIZE_VERTICAL)!=0,info.minHeight,info.minResizeHeight,info.maxResizeHeight,geometry[1],geometry[2]))result.add(new int[]{x,y});
         }

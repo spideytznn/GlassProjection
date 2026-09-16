@@ -4,7 +4,8 @@ import java.util.*;
 
 /** Stable desktop order, independent of either display's pixel dimensions. */
 final class HomeLayout {
-    static final int PAGE_SIZE=16, DOCK_SIZE=4;
+    /** HyperOS-style workspace: 4 columns × 5 rows. */
+    static final int COLUMNS=4,ROWS=5,PAGE_SIZE=COLUMNS*ROWS,DOCK_SIZE=4;
     static final class Item {
         final String id;
         String title;
@@ -30,20 +31,22 @@ final class HomeLayout {
         items.add(new Item(UUID.randomUUID().toString(),"",Collections.singletonList(app)));
     }
     List<Cell> cells(){
-        List<Cell> result=new ArrayList<>();boolean[] occupied=new boolean[16];int current=0;
+        List<Cell> result=new ArrayList<>();boolean[] occupied=new boolean[PAGE_SIZE];int current=0;
         for(Item item:items){
-            int width=item.widget()?Math.max(1,Math.min(4,item.spanX)):1,height=item.widget()?Math.max(1,Math.min(4,item.spanY)):1;
+            int width=item.widget()?Math.max(1,Math.min(COLUMNS,item.spanX)):1;
+            int height=item.widget()?Math.max(1,Math.min(ROWS,item.spanY)):1;
             int found=-1;
             while(found<0){
-                for(int i=0;i<16&&found<0;i++){
-                    int x=i%4,y=i/4;if(x+width>4||y+height>4)continue;boolean free=true;
-                    for(int dy=0;dy<height;dy++)for(int dx=0;dx<width;dx++)if(occupied[(y+dy)*4+x+dx])free=false;
+                for(int i=0;i<PAGE_SIZE&&found<0;i++){
+                    int x=i%COLUMNS,y=i/COLUMNS;
+                    if(x+width>COLUMNS||y+height>ROWS)continue;boolean free=true;
+                    for(int dy=0;dy<height;dy++)for(int dx=0;dx<width;dx++)if(occupied[(y+dy)*COLUMNS+x+dx])free=false;
                     if(free)found=i;
                 }
-                if(found<0){current++;occupied=new boolean[16];}
+                if(found<0){current++;occupied=new boolean[PAGE_SIZE];}
             }
-            int x=found%4,y=found/4;
-            for(int dy=0;dy<height;dy++)for(int dx=0;dx<width;dx++)occupied[(y+dy)*4+x+dx]=true;
+            int x=found%COLUMNS,y=found/COLUMNS;
+            for(int dy=0;dy<height;dy++)for(int dx=0;dx<width;dx++)occupied[(y+dy)*COLUMNS+x+dx]=true;
             result.add(new Cell(item,current,x,y,width,height));
         }
         return result;

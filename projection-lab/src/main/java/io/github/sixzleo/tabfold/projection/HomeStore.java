@@ -33,7 +33,8 @@ final class HomeStore {
                 if(widget>=0){
                     boolean duplicate=false;for(HomeLayout.Item existing:layout.items)if(existing.widgetId==widget)duplicate=true;
                     if(!duplicate){HomeLayout.Item item=new HomeLayout.Item(id,"",Collections.emptyList());item.widgetId=widget;
-                        item.spanX=Math.max(1,Math.min(4,value.optInt("spanX",2)));item.spanY=Math.max(1,Math.min(4,value.optInt("spanY",2)));layout.items.add(item);}
+                        item.spanX=Math.max(1,Math.min(HomeLayout.COLUMNS,value.optInt("spanX",2)));
+                        item.spanY=Math.max(1,Math.min(HomeLayout.ROWS,value.optInt("spanY",2)));layout.items.add(item);}
                 }else if(!apps.isEmpty())layout.items.add(new HomeLayout.Item(id,value.optString("title",""),apps));
             }
             JSONArray dock=root.optJSONArray("dock");if(dock!=null)for(int n=0;n<dock.length();n++){String app=dock.optString(n,"");if(!app.isEmpty())layout.pin(app);}
