@@ -1,160 +1,443 @@
 package io.github.sixzleo.tabfold.projection;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
+import android.animation.ValueAnimator;
 import android.app.NotificationManager;
 import android.app.UiModeManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
-import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
+import android.graphics.Insets;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.PixelFormat;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffXfermode;
+import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
+import android.media.AudioManager;
 import android.net.Uri;
+import android.os.BatteryManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.text.TextUtils;
+import android.text.format.DateFormat;
+import android.util.Log;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.view.WindowManager;
+import android.view.animation.PathInterpolator;
+import android.widget.FrameLayout;
 import android.widget.GridLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
-import android.widget.SeekBar;
+import android.widget.TextClock;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.function.Consumer;
 
-/** Two HyperOS-style panes: top-left pull = notification center, top-right = control center. */
+/**
+ * iOS-style shade in an accessibility overlay window. Notifications and control
+ * are two real side-by-side pages inside a scrolled track, so pane swipes track
+ * the finger 1:1 and settle in one continuous motion.
+ */
 final class HomeControlPanel {
-    private static final int MIUI_BLUE=0xff3c7bfa,TILE_IDLE=0x26ffffff;
-    static final int MODE_NOTIFICATIONS=0,MODE_CONTROL=1;
-    final HomeSheet sheet;
-    private final DuoHomeActivity activity;
-    private final boolean control;
-    private final LinearLayout notifBox;
-    private TextView notifHead;
-    private LinearLayout torchTile,rotateTile,dndTile,darkTile;
+    // Glass materials: dock-tinted translucency with a bottom fade instead of a solid edge.
+    private static final int TEXT=0xfff2f2f7, MUTED=0x99ebebf5, BLUE=0xff0a84ff;
+    private static final int PANEL_TINT=0x8c343b43, MODULE=0x42787880, CARD=0x463a3a44;
+    private static final int TORCH_ON=0xfff2f2f7, TORCH_GLYPH=0xff16161c, INDIGO=0xff5e5ce6;
+    private static final Typeface MEDIUM=Typeface.create("sans-serif-medium",Typeface.NORMAL);
+
+    private static final Map<Integer,HomeControlPanel> currentByDisplay=new HashMap<>();
+
+    private final ProjectionService service;
+    private final android.view.Display display;
+    private final WindowManager manager;
+    private final FrameLayout root;
+    private final LinearLayout panel;
+    private final PaneHost paneHost;
+    private final LinearLayout controlPane,notifPane;
+    private final View scrim;
+    private boolean control;
+    private float fade; // 0 = notification page, 1 = control page
+    private boolean animating;
+    private LinearLayout torchTile,rotateTile,dndTile,darkTile,wifiTile,btTile,dataTile,airTile;
+    private boolean wifiOn,btOn,dataOn=true,airOn;
+    private PillSlider brightnessSlider,volumeSlider;
+    private ScrollView notifList;
+    private LinearLayout notifBox;
+    private TextView notifHead,batteryLabel;
     private final SimpleDateFormat timeFormat=new SimpleDateFormat("HH:mm",Locale.CHINA);
     private final Handler main=new Handler(Looper.getMainLooper());
     private final Runnable change=this::refreshNotifications;
+    private final BroadcastReceiver batteryReceiver=new BroadcastReceiver(){
+        public void onReceive(Context context,Intent intent){
+            int level=intent.getIntExtra(BatteryManager.EXTRA_LEVEL,-1),scale=intent.getIntExtra(BatteryManager.EXTRA_SCALE,100);
+            int status=intent.getIntExtra(BatteryManager.EXTRA_STATUS,-1);
+            batteryCharging=status==BatteryManager.BATTERY_STATUS_CHARGING||status==BatteryManager.BATTERY_STATUS_FULL;
+            batteryPercent=level>=0&&scale>0?Math.round(level*100f/scale):0;
+            paintBattery();
+        }
+    };
+    private int batteryPercent=-1;
+    private boolean batteryCharging;
     private CameraManager torchManager;
     private String torchId;
-    private boolean torchOn,closed;
+    private boolean torchOn,closed,attached;
+
     private final CameraManager.TorchCallback torchCallback=new CameraManager.TorchCallback(){
-        @Override public void onTorchModeChanged(String id,boolean enabled){torchOn=enabled;main.post(()->{if(!closed)paintTiles();});}
+        @Override public void onTorchModeChanged(String id,boolean enabled){torchOn=enabled;main.post(()->{if(!closed&&control)paintTiles();});}
     };
 
-    HomeControlPanel(DuoHomeActivity activity,boolean control){
-        this.activity=activity;this.control=control;
-        sheet=new HomeSheet(activity,440,control?460:560);sheet.header(control?"控制中心":"通知中心");
-        if(control){
-            sheet.content.addView(dateBatteryRow(),new LinearLayout.LayoutParams(-1,dp(30)));
-            sheet.content.addView(brightnessBar(),new LinearLayout.LayoutParams(-1,dp(48)));
-            torchTile=tileLabel("手电筒",TileIcon.TORCH);rotateTile=tileLabel("自动旋转",TileIcon.ROTATE);
-            dndTile=tileLabel("勿扰",TileIcon.DND);darkTile=tileLabel("深色模式",TileIcon.DARK);
-            android.widget.GridLayout grid=new android.widget.GridLayout(activity);grid.setColumnCount(4);
-            grid.addView(torchTile,tileSpec());grid.addView(rotateTile,tileSpec());
-            grid.addView(dndTile,tileSpec());grid.addView(darkTile,tileSpec());
-            sheet.content.addView(grid,new LinearLayout.LayoutParams(-1,dp(84)));
-        }else notifHead=null;
-        notifHead=HomeStyle.text(activity,"通知",15,HomeStyle.TEXT);
-        notifHead.setPadding(dp(4),dp(12),dp(4),dp(6));
-        LinearLayout headRow=new LinearLayout(activity);headRow.setGravity(Gravity.CENTER_VERTICAL);
-        notifHead.setLayoutParams(new LinearLayout.LayoutParams(0,-2,1));
-        headRow.addView(notifHead);
-        headRow.addView(HomeStyle.button(activity,"全部清除",DuoNotifications::cancelAll),new LinearLayout.LayoutParams(-2,dp(34)));
-        sheet.content.addView(headRow,new LinearLayout.LayoutParams(-1,dp(36)));
-        notifBox=new LinearLayout(activity);notifBox.setOrientation(LinearLayout.VERTICAL);
-        ScrollView scroll=new ScrollView(activity);scroll.setVerticalScrollBarEnabled(false);
-        scroll.addView(notifBox,new ViewGroup.LayoutParams(-1,-2));
-        sheet.content.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
-        torchManager=(CameraManager)activity.getSystemService(Context.CAMERA_SERVICE);
+    /** Opens (or switches) the shade on a display; one shade per display at a time. */
+    static void open(int displayId,boolean control){
+        ProjectionService s=ProjectionService.instance;if(s==null)return;
+        HomeControlPanel showing=currentByDisplay.get(displayId);
+        if(showing!=null&&showing.attached){showing.switchTo(control);return;}
+        android.view.Display target=s.getSystemService(android.hardware.display.DisplayManager.class).getDisplay(displayId);
+        if(target==null)return;
+        HomeControlPanel created=new HomeControlPanel(s,target,control);
+        if(created.attached)currentByDisplay.put(displayId,created);
+    }
+
+    private HomeControlPanel(ProjectionService service,android.view.Display display,boolean control){
+        this.service=service;this.display=display;this.control=control;
+        Context wc=service.createDisplayContext(display)
+            .createWindowContext(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,null);
+        manager=wc.getSystemService(WindowManager.class);
+        torchManager=(CameraManager)service.getSystemService(Context.CAMERA_SERVICE);
         try{
             for(String id:torchManager.getCameraIdList()){
                 Boolean flash=torchManager.getCameraCharacteristics(id).get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
                 if(flash!=null&&flash){torchId=id;break;}
             }
         }catch(CameraAccessException ignored){}
-        sheet.setOnDismissListener(dialog->{closed=true;torchManager.unregisterTorchCallback(torchCallback);DuoNotifications.forget(change);});
-    }
-    void show(){
-        torchManager.registerTorchCallback(torchCallback,null);
+
+        scrim=new View(wc);scrim.setBackgroundColor(0x66000000);
+        scrim.setOnClickListener(v->close());
+        panel=new LinearLayout(wc);panel.setOrientation(LinearLayout.VERTICAL);
+        // Full-bleed glass like the dock, melting into the wallpaper at the bottom edge.
+        panel.setBackground(new GlassFade(PANEL_TINT,dp(110)));
+        panel.setPadding(dp(18),dp(8),dp(18),dp(14));
+        panel.setClickable(true);
+        HomeGlass.apply(panel,dp(32),0);
+        controlPane=new LinearLayout(wc);controlPane.setOrientation(LinearLayout.VERTICAL);
+        controlPane.setOnClickListener(v->close());
+        notifPane=new LinearLayout(wc);notifPane.setOrientation(LinearLayout.VERTICAL);
+        notifPane.setOnClickListener(v->close());
+        paneHost=new PaneHost(wc);
+        paneHost.addView(notifPane,new FrameLayout.LayoutParams(-1,-1));
+        paneHost.addView(controlPane,new FrameLayout.LayoutParams(-1,-1));
+        panel.addView(paneHost,new LinearLayout.LayoutParams(-1,0,1f));
+        root=new FrameLayout(wc);
+        root.setOnClickListener(v->close());
+        root.addView(scrim,new FrameLayout.LayoutParams(-1,-1));
+        root.addView(panel,new FrameLayout.LayoutParams(-1,-1));
+        root.setOnApplyWindowInsetsListener((v,insets)->{
+            Insets safe=insets.getInsets(WindowInsets.Type.systemBars()|WindowInsets.Type.displayCutout());
+            panel.setPadding(dp(18),safe.top+dp(10),dp(18),Math.max(safe.bottom,dp(14)));
+            return insets;
+        });
+
+        WindowManager.LayoutParams p=new WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                |WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSLUCENT);
+        p.gravity=Gravity.TOP|Gravity.LEFT;p.setFitInsetsTypes(0);
+        p.layoutInDisplayCutoutMode=WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        p.setTitle("Duo home shade");
+        try{manager.addView(root,p);attached=true;}
+        catch(RuntimeException failed){Log.w("GlassHome","Shade overlay unavailable",failed);destroy();return;}
+        buildControlPane(controlPane);
+        buildNotifPane(notifPane);
         DuoNotifications.observe(change);
-        activity.show(sheet);
+        settle(control);
+        try{service.registerReceiver(batteryReceiver,new IntentFilter(Intent.ACTION_BATTERY_CHANGED));}catch(RuntimeException ignored){}
+
+        float drop=service.getResources().getDisplayMetrics().heightPixels*0.6f;
+        panel.setTranslationY(-drop);scrim.setAlpha(0f);
+        if(!android.animation.ValueAnimator.areAnimatorsEnabled()){
+            panel.setTranslationY(0f);scrim.setAlpha(1f);return;
+        }
+        scrim.animate().alpha(1f).setDuration(240).start();
+        panel.animate().translationY(0f).setDuration(340)
+            .setInterpolator(new PathInterpolator(.32f,.72f,0f,1f)).start();
+    }
+    void close(){
+        if(closed||animating||!attached)return;
+        if(!android.animation.ValueAnimator.areAnimatorsEnabled()){destroy();return;}
+        animating=true;
+        // Mirror of the drop-in: slide the whole panel back up the same distance,
+        // fading the scrim in parallel — no alpha tricks on the panel itself.
+        scrim.animate().alpha(0f).setDuration(240).start();
+        panel.animate()
+            .translationY(-service.getResources().getDisplayMetrics().heightPixels*0.6f)
+            .setDuration(320)
+            .setInterpolator(new PathInterpolator(.55f,.05f,.8f,.6f))
+            .withEndAction(this::destroy).start();
+    }
+    /** Close a shade left open on a display, e.g. when the user returns home. */
+    static void closeIfOpen(int displayId){
+        HomeControlPanel panel=currentByDisplay.get(displayId);
+        if(panel!=null&&panel.attached)panel.close();
+    }
+    private void destroy(){
+        if(closed)return;closed=true;attached=false;
+        setTorchListening(false);DuoNotifications.forget(change);
+        paneHost.recycle();
+        try{service.unregisterReceiver(batteryReceiver);}catch(IllegalArgumentException ignored){}
+        try{manager.removeViewImmediate(root);}catch(IllegalArgumentException ignored){}
+        if(currentByDisplay.get(display.getDisplayId())==this)currentByDisplay.remove(display.getDisplayId());
+    }
+    private void applyFade(){
+        notifPane.setAlpha(1f-fade);
+        controlPane.setAlpha(fade);
+    }
+    private void settle(boolean wantControl){
+        fade=wantControl?1f:0f;applyFade();
+        notifPane.setVisibility(wantControl?View.INVISIBLE:View.VISIBLE);
+        controlPane.setVisibility(wantControl?View.VISIBLE:View.INVISIBLE);
+        if(control!=wantControl){control=wantControl;setTorchListening(control);}
         if(control)paintTiles();
+    }
+    private void switchTo(boolean wantControl){
+        if(paneHost.dragging())return;
+        animateFadeTo(wantControl);
+    }
+    private void animateFadeTo(boolean wantControl){
+        if(animating)return;
+        if(control==wantControl&&fade==(wantControl?1f:0f))return;
+        animating=true;
+        notifPane.setVisibility(View.VISIBLE);controlPane.setVisibility(View.VISIBLE);
+        ValueAnimator run=ValueAnimator.ofFloat(fade,wantControl?1f:0f);
+        run.setDuration(230);
+        run.setInterpolator(new PathInterpolator(.3f,.6f,.1f,1f));
+        run.addUpdateListener(a->{fade=(float)a.getAnimatedValue();applyFade();});
+        run.addListener(new AnimatorListenerAdapter(){
+            @Override public void onAnimationEnd(Animator a){animating=false;settle(wantControl);}
+        });
+        run.start();
+    }
+    private void buildControlPane(LinearLayout target){
+        readConnectivityStates();
+        target.addView(compactHeader(),new LinearLayout.LayoutParams(-1,dp(42)));
+        target.addView(brightnessRow(),rowMargins(dp(52)));
+        target.addView(volumeRow(),rowMargins(dp(52)));
+        GridLayout grid=new GridLayout(service);grid.setColumnCount(4);
+        wifiTile=circle("Wi-Fi",TileIcon.WIFI);
+        btTile=circle("蓝牙",TileIcon.BLUETOOTH);
+        dataTile=circle("数据",TileIcon.CELL);
+        airTile=circle("飞行模式",TileIcon.AIRPLANE);
+        torchTile=circle("手电筒",TileIcon.TORCH);
+        rotateTile=circle("自动旋转",TileIcon.ROTATE);
+        dndTile=circle("勿扰",TileIcon.DND);
+        darkTile=circle("深色模式",TileIcon.DARK);
+        for(View tile:new View[]{wifiTile,btTile,dataTile,airTile,torchTile,rotateTile,dndTile,darkTile})
+            grid.addView(tile,circleSpec());
+        target.addView(grid,rowMargins(dp(168)));
+        paintTiles();
+    }
+    private void buildNotifPane(LinearLayout target){
+        // One compact top bar: small clock top-left, date beside it, clear-all right —
+        // the old hero clock squeezed the notification list.
+        LinearLayout head=new LinearLayout(service);head.setGravity(Gravity.CENTER_VERTICAL);
+        head.setPadding(dp(2),dp(4),dp(2),dp(2));
+        TextClock clock=new TextClock(service);
+        clock.setFormat12Hour(DateFormat.is24HourFormat(service)?"HH:mm":"h:mm");
+        clock.setFormat24Hour("HH:mm");
+        clock.setTextSize(22);clock.setTextColor(TEXT);clock.setTypeface(MEDIUM);
+        head.addView(clock,new LinearLayout.LayoutParams(-2,-2));
+        LinearLayout.LayoutParams dateGap=new LinearLayout.LayoutParams(dp(10),dp(36));
+        head.addView(new View(service),dateGap);
+        String date=new SimpleDateFormat("M月d日 EEEE",Locale.CHINA).format(new Date());
+        TextView dateLabel=HomeStyle.text(service,date,12,MUTED);
+        head.addView(dateLabel,new LinearLayout.LayoutParams(-2,-2));
+        head.addView(new View(service),new LinearLayout.LayoutParams(0,-2,1));
+        TextView clear=HomeStyle.text(service,"全部清除",13,BLUE);
+        clear.setGravity(Gravity.CENTER);
+        clear.setBackground(HomeStyle.ripple(clear,16));
+        clear.setPadding(dp(14),0,dp(14),0);
+        clear.setOnClickListener(v->DuoNotifications.cancelAll());
+        head.addView(clear,new LinearLayout.LayoutParams(-2,dp(32)));
+        target.addView(head,new LinearLayout.LayoutParams(-1,dp(40)));
+
+        notifBox=new LinearLayout(service);notifBox.setOrientation(LinearLayout.VERTICAL);
+        notifList=new ScrollView(service){
+            // The stock ScrollView silences parent interception once it claims a drag,
+            // which eats horizontal flicks and the up-dismiss; keep the host in charge.
+            @Override public void requestDisallowInterceptTouchEvent(boolean disallow){}
+        };
+        notifList.setVerticalScrollBarEnabled(false);
+        notifList.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        // Cards melt into the panel's fading bottom edge.
+        notifList.setVerticalFadingEdgeEnabled(true);
+        notifList.setFadingEdgeLength(dp(88));
+        notifList.addView(notifBox,new ViewGroup.LayoutParams(-1,-2));
+        LinearLayout.LayoutParams listSize=new LinearLayout.LayoutParams(-1,0,1f);
+        // Keep a modest glass grab-zone below the list (~4.5 cards visible).
+        listSize.bottomMargin=dp(52);
+        target.addView(notifList,listSize);
         refreshNotifications();
     }
-    private int dp(float value){return Math.round(value*activity.getResources().getDisplayMetrics().density);}
-
-    private View dateBatteryRow(){
-        LinearLayout row=new LinearLayout(activity);row.setGravity(Gravity.CENTER_VERTICAL);row.setPadding(dp(4),0,dp(4),0);
-        String date=new SimpleDateFormat("M月d日 EEEE",Locale.CHINA).format(new Date());
-        row.addView(HomeStyle.text(activity,date,13,HomeStyle.MUTED),new LinearLayout.LayoutParams(0,-1,1));
-        row.addView(HomeStyle.text(activity,batteryPercent()+"%",12,HomeStyle.MUTED),new LinearLayout.LayoutParams(-2,-1));
+    private View compactHeader(){
+        LinearLayout row=new LinearLayout(service);row.setGravity(Gravity.CENTER_VERTICAL);
+        TextClock clock=new TextClock(service);
+        clock.setFormat12Hour(DateFormat.is24HourFormat(service)?"HH:mm":"h:mm");
+        clock.setFormat24Hour("HH:mm");
+        clock.setTextSize(17);clock.setTextColor(TEXT);clock.setTypeface(MEDIUM);
+        row.addView(clock,new LinearLayout.LayoutParams(-2,-2));
+        row.addView(new View(service),new LinearLayout.LayoutParams(0,-2,1));
+        batteryLabel=HomeStyle.text(service,"",13,TEXT);batteryLabel.setTypeface(MEDIUM);
+        row.addView(batteryLabel,new LinearLayout.LayoutParams(-2,-2));
+        LinearLayout.LayoutParams gearGap=new LinearLayout.LayoutParams(dp(10),dp(38));
+        row.addView(new View(service),gearGap);
+        FrameLayout gear=new FrameLayout(service);
+        TileIcon glyph=new TileIcon(service,TileIcon.GEAR);
+        glyph.setColor(0xddf2f2f7);
+        gear.addView(glyph,new FrameLayout.LayoutParams(dp(21),dp(21),Gravity.CENTER));
+        gear.setBackground(HomeStyle.ripple(gear,19));
+        gear.setContentDescription("设置");
+        gear.setOnClickListener(v->start(new Intent(Settings.ACTION_SETTINGS)));
+        row.addView(gear,new LinearLayout.LayoutParams(dp(38),dp(38)));
+        paintBattery();
         return row;
     }
-    private int batteryPercent(){
-        Intent sticky=activity.registerReceiver(null,new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-        if(sticky==null)return 0;
-        int level=sticky.getIntExtra("level",-1),scale=sticky.getIntExtra("scale",100);
-        return level>=0&&scale>0?Math.round(level*100f/scale):0;
+    private LinearLayout.LayoutParams rowMargins(int height){
+        LinearLayout.LayoutParams size=new LinearLayout.LayoutParams(-1,height);
+        size.topMargin=dp(14);return size;
     }
-    private LinearLayout tileLabel(String label,int icon){
-        LinearLayout box=new LinearLayout(activity);box.setOrientation(LinearLayout.VERTICAL);
-        box.setGravity(Gravity.CENTER);box.setBackground(HomeStyle.surface(box,TILE_IDLE,22));
-        TileIcon glyph=new TileIcon(activity,icon);box.addView(glyph,new LinearLayout.LayoutParams(dp(25),dp(25)));
-        TextView text=HomeStyle.text(activity,label,11,HomeStyle.TEXT);text.setGravity(Gravity.CENTER);
-        box.addView(text,new LinearLayout.LayoutParams(-2,-2));
+    private TextView pill(String label,View.OnClickListener action){
+        TextView pill=pillText(label);pill.setOnClickListener(action);return pill;
+    }
+    private TextView pillText(String label){
+        TextView pill=HomeStyle.text(service,label,15,TEXT);
+        pill.setGravity(Gravity.CENTER);pill.setTypeface(MEDIUM);
+        pill.setBackground(HomeStyle.ripple(pill,23));
+        return pill;
+    }
+    private void start(Intent intent){
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try{service.startActivity(intent);}catch(RuntimeException e){toast("无法打开");}
+    }
+    private void toast(String value){Toast.makeText(service,value,Toast.LENGTH_SHORT).show();}
+
+    // ---- tiles ----
+    private LinearLayout circle(String label,int glyphType){
+        LinearLayout box=new LinearLayout(service);box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        FrameLayout circle=new FrameLayout(service);
+        TileIcon glyph=new TileIcon(service,glyphType);
+        circle.addView(glyph,new FrameLayout.LayoutParams(dp(25),dp(25),Gravity.CENTER));
+        box.addView(circle,new LinearLayout.LayoutParams(dp(52),dp(52)));
+        TextView text=HomeStyle.text(service,label,11,MUTED);
+        text.setGravity(Gravity.CENTER);text.setSingleLine(true);
+        box.addView(text,new LinearLayout.LayoutParams(-2,dp(15)));
+        box.setTag(new Object[]{circle,glyph,text});
         box.setOnClickListener(v->onTile(label));
-        box.setTag(new Object[]{glyph,text});
         return box;
     }
-    private android.widget.GridLayout.LayoutParams tileSpec(){
-        android.widget.GridLayout.LayoutParams spec=new android.widget.GridLayout.LayoutParams(
-            android.widget.GridLayout.spec(0,1,1f),android.widget.GridLayout.spec(android.widget.GridLayout.UNDEFINED,1,1f));
-        spec.width=0;spec.height=dp(78);
-        spec.setMargins(dp(3),0,dp(3),0);
+    private GridLayout.LayoutParams circleSpec(){
+        GridLayout.LayoutParams spec=new GridLayout.LayoutParams(
+            GridLayout.spec(GridLayout.UNDEFINED,1,1f),GridLayout.spec(GridLayout.UNDEFINED,1,1f));
+        spec.width=0;spec.height=dp(80);
+        spec.setMargins(dp(3),dp(3),dp(3),dp(3));
         return spec;
+    }
+    private void readConnectivityStates(){
+        try{wifiOn=((android.net.wifi.WifiManager)service.getSystemService(Context.WIFI_SERVICE)).isWifiEnabled();}catch(Exception ignored){}
+        try{
+            android.bluetooth.BluetoothAdapter adapter=((android.bluetooth.BluetoothManager)
+                service.getSystemService(Context.BLUETOOTH_SERVICE)).getAdapter();
+            btOn=adapter!=null&&adapter.isEnabled();
+        }catch(SecurityException ignored){}
+        try{airOn=Settings.Global.getInt(service.getContentResolver(),Settings.Global.AIRPLANE_MODE_ON,0)==1;}catch(Exception ignored){}
+        try{dataOn=Settings.Global.getInt(service.getContentResolver(),"mobile_data",1)==1;}catch(Exception ignored){}
+    }
+    /** Shell toggle through the Shizuku helper; falls back to the matching system panel. */
+    private void svcToggle(String enable,String disable,boolean current,Runnable afterRead,String fallbackAction){
+        if(!MobileHelper.ready()){
+            if(fallbackAction!=null)start(new Intent(fallbackAction));
+            toast("需要 Shizuku，已打开系统面板");
+            return;
+        }
+        MobileHelper.svc(current?disable:enable,out->{
+            if(out.startsWith("ERROR"))toast("切换失败："+out);
+            afterRead.run();
+            paintTiles();
+        });
     }
     private void onTile(String label){
         switch(label){
+            case "Wi-Fi":{
+                svcToggle("svc wifi enable","svc wifi disable",wifiOn,()->{
+                    try{wifiOn=((android.net.wifi.WifiManager)service.getSystemService(Context.WIFI_SERVICE)).isWifiEnabled();}
+                    catch(Exception ignored){wifiOn=!wifiOn;}
+                },Settings.Panel.ACTION_INTERNET_CONNECTIVITY);
+                return;
+            }
+            case "蓝牙":{
+                svcToggle("svc bluetooth enable","svc bluetooth disable",btOn,()->btOn=!btOn,
+                    Settings.ACTION_BLUETOOTH_SETTINGS);
+                return;
+            }
+            case "数据":{
+                svcToggle("svc data enable","svc data disable",dataOn,()->dataOn=!dataOn,
+                    Settings.Panel.ACTION_INTERNET_CONNECTIVITY);
+                return;
+            }
+            case "飞行模式":{
+                svcToggle("cmd connectivity airplane-mode enable","cmd connectivity airplane-mode disable",airOn,()->{
+                    try{airOn=Settings.Global.getInt(service.getContentResolver(),Settings.Global.AIRPLANE_MODE_ON,0)==1;}
+                    catch(Exception ignored){airOn=!airOn;}
+                },Settings.ACTION_AIRPLANE_MODE_SETTINGS);
+                return;
+            }
             case "手电筒":{
-                if(torchId==null){activity.message("没有可用的闪光灯");return;}
+                if(torchId==null){toast("没有可用的闪光灯");return;}
                 try{torchManager.setTorchMode(torchId,!torchOn);}catch(CameraAccessException ignored){}
                 return;
             }
             case "自动旋转":{
-                if(!Settings.System.canWrite(activity)){openWriteSettings();return;}
-                int current=Settings.System.getInt(activity.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,0);
-                Settings.System.putInt(activity.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,current==1?0:1);
+                if(!Settings.System.canWrite(service)){openWriteSettings();return;}
+                int current=Settings.System.getInt(service.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,0);
+                Settings.System.putInt(service.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,current==1?0:1);
                 paintTiles();return;
             }
             case "勿扰":{
-                NotificationManager notifications=(NotificationManager)activity.getSystemService(Context.NOTIFICATION_SERVICE);
+                NotificationManager notifications=(NotificationManager)service.getSystemService(Context.NOTIFICATION_SERVICE);
                 if(notifications==null)return;
                 if(!notifications.isNotificationPolicyAccessGranted()){
-                    activity.startActivity(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS));
-                    activity.message("请允许勿扰权限后返回");return;
+                    start(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS));
+                    toast("请允许勿扰权限后返回");return;
                 }
                 boolean active=notifications.getCurrentInterruptionFilter()!=NotificationManager.INTERRUPTION_FILTER_ALL;
                 notifications.setInterruptionFilter(active?NotificationManager.INTERRUPTION_FILTER_ALL:NotificationManager.INTERRUPTION_FILTER_PRIORITY);
                 paintTiles();return;
             }
             case "深色模式":{
-                UiModeManager uiMode=(UiModeManager)activity.getSystemService(Context.UI_MODE_SERVICE);
+                UiModeManager uiMode=(UiModeManager)service.getSystemService(Context.UI_MODE_SERVICE);
                 if(uiMode==null)return;
-                boolean dark=(activity.getResources().getConfiguration().uiMode&android.content.res.Configuration.UI_MODE_NIGHT_MASK)
+                boolean dark=(service.getResources().getConfiguration().uiMode&android.content.res.Configuration.UI_MODE_NIGHT_MASK)
                     ==android.content.res.Configuration.UI_MODE_NIGHT_YES;
                 uiMode.setNightMode(dark?UiModeManager.MODE_NIGHT_NO:UiModeManager.MODE_NIGHT_YES);
                 return;
@@ -162,116 +445,383 @@ final class HomeControlPanel {
         }
     }
     private void paintTiles(){
-        if(closed)return;
-        boolean rotate=Settings.System.getInt(activity.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,0)==1;
-        NotificationManager notifications=(NotificationManager)activity.getSystemService(Context.NOTIFICATION_SERVICE);
+        if(wifiTile==null||torchTile==null)return;
+        boolean rotate=Settings.System.getInt(service.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,0)==1;
+        NotificationManager notifications=(NotificationManager)service.getSystemService(Context.NOTIFICATION_SERVICE);
         boolean dnd=notifications!=null&&notifications.getCurrentInterruptionFilter()!=NotificationManager.INTERRUPTION_FILTER_ALL;
-        boolean dark=(activity.getResources().getConfiguration().uiMode&android.content.res.Configuration.UI_MODE_NIGHT_MASK)
+        boolean dark=(service.getResources().getConfiguration().uiMode&android.content.res.Configuration.UI_MODE_NIGHT_MASK)
             ==android.content.res.Configuration.UI_MODE_NIGHT_YES;
-        paintTile(torchTile,torchOn);paintTile(rotateTile,rotate);paintTile(dndTile,dnd);paintTile(darkTile,dark);
+        paintCircle(wifiTile,wifiOn,BLUE,0xffffffff);
+        paintCircle(btTile,btOn,BLUE,0xffffffff);
+        paintCircle(dataTile,dataOn,BLUE,0xffffffff);
+        paintCircle(airTile,airOn,BLUE,0xffffffff);
+        paintCircle(torchTile,torchOn,TORCH_ON,TORCH_GLYPH);
+        paintCircle(rotateTile,rotate,BLUE,0xffffffff);
+        paintCircle(dndTile,dnd,INDIGO,0xffffffff);
+        paintCircle(darkTile,dark,BLUE,0xffffffff);
     }
-    private void paintTile(LinearLayout tile,boolean active){
-        Object[] parts=(Object[])tile.getTag();
-        TileIcon glyph=(TileIcon)parts[0];TextView label=(TextView)parts[1];
-        int color=active?MIUI_BLUE:HomeStyle.TEXT;
-        glyph.setColor(color);
-        label.setTextColor(active?MIUI_BLUE:HomeStyle.TEXT);
-        tile.setBackground(HomeStyle.surface(tile,TILE_IDLE,22));
+    private void paintCircle(LinearLayout box,boolean active,int activeBg,int activeGlyph){
+        Object[] parts=(Object[])box.getTag();
+        FrameLayout circle=(FrameLayout)parts[0];
+        TileIcon glyph=(TileIcon)parts[1];TextView label=(TextView)parts[2];
+        glyph.setColor(active?activeGlyph:0xfff2f2f7);
+        label.setTextColor(active?0xffffffff:MUTED);
+        circle.setBackground(HomeStyle.surface(circle,active?activeBg:0x33787880,999));
+    }
+    private void paintBattery(){
+        if(batteryLabel==null||batteryPercent<0)return;
+        batteryLabel.setText(batteryCharging?"⚡ "+batteryPercent+"%":batteryPercent+"%");
+    }
+    private void setTorchListening(boolean on){
+        try{
+            if(on)torchManager.registerTorchCallback(torchCallback,main);
+            else torchManager.unregisterTorchCallback(torchCallback);
+        }catch(RuntimeException ignored){}
     }
     private void openWriteSettings(){
-        activity.startActivity(new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS).setData(Uri.parse("package:"+activity.getPackageName())));
-        activity.message("请允许修改系统设置后返回");
+        start(new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS).setData(Uri.parse("package:"+service.getPackageName())));
+        toast("请允许修改系统设置后返回");
     }
-    private View brightnessBar(){
-        LinearLayout row=new LinearLayout(activity);row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(12),0,dp(12),0);
-        row.setBackground(HomeStyle.surface(row,HomeStyle.FIELD,HomeStyle.FIELD_RADIUS));
-        LinearLayout.LayoutParams rowSize=new LinearLayout.LayoutParams(-1,dp(46));rowSize.topMargin=dp(6);
-        row.setLayoutParams(rowSize);
-        TextView sun=HomeStyle.text(activity,"☀",15,HomeStyle.TEXT);sun.setGravity(Gravity.CENTER);
-        row.addView(sun,new LinearLayout.LayoutParams(dp(26),-1));
-        SeekBar seek=new SeekBar(activity);
-        boolean granted=Settings.System.canWrite(activity);
-        seek.setMax(255);
-        try{seek.setProgress(Settings.System.getInt(activity.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,120));}catch(RuntimeException ignored){}
-        seek.setEnabled(granted);
-        seek.setProgressTintList(ColorStateList.valueOf(0xffffffff));
-        seek.setProgressBackgroundTintList(ColorStateList.valueOf(0x33ffffff));
-        seek.setThumbTintList(ColorStateList.valueOf(0xffffffff));
-        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
-            public void onProgressChanged(SeekBar bar,int value,boolean fromUser){
-                if(!fromUser)return;
-                try{Settings.System.putInt(activity.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,value);}catch(RuntimeException ignored){}
-            }
-            public void onStartTrackingTouch(SeekBar bar){}
-            public void onStopTrackingTouch(SeekBar bar){}
+
+    // ---- sliders ----
+    private View brightnessRow(){
+        brightnessSlider=new PillSlider(service,true);
+        PillSlider slider=brightnessSlider;
+        boolean granted=Settings.System.canWrite(service);
+        int value;
+        try{value=Settings.System.getInt(service.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,120);}
+        catch(RuntimeException e){value=120;}
+        slider.setValue(value/255f);
+        slider.setEnabled(granted);
+        slider.setChange(t->{
+            try{Settings.System.putInt(service.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,Math.max(2,Math.round(t*255f)));}
+            catch(RuntimeException ignored){}
         });
-        row.addView(seek,new LinearLayout.LayoutParams(0,dp(42),1));
-        if(!granted)row.setOnClickListener(v->openWriteSettings());
-        return row;
+        if(!granted)slider.setOnClickListener(v->openWriteSettings());
+        return slider;
     }
+    private View volumeRow(){
+        AudioManager audio=(AudioManager)service.getSystemService(Context.AUDIO_SERVICE);
+        volumeSlider=new PillSlider(service,false);
+        PillSlider slider=volumeSlider;
+        int max=audio!=null?audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC):15;
+        int now=audio!=null?audio.getStreamVolume(AudioManager.STREAM_MUSIC):8;
+        slider.setValue(max>0?Math.min(1f,now/(float)max):0f);
+        slider.setChange(t->{
+            try{audio.setStreamVolume(AudioManager.STREAM_MUSIC,Math.round(t*max),0);}catch(RuntimeException ignored){}
+        });
+        return slider;
+    }
+
+    // ---- notifications ----
     private void refreshNotifications(){
-        if(closed)return;
+        if(closed||notifBox==null)return;
         notifBox.removeAllViews();
         if(!DuoNotifications.available()){
-            notifBox.addView(hintRow("通知读取未授权，点击前往授权",v->activity.startActivity(
-                new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))));
+            boolean helper=MobileHelper.ready();
+            notifBox.addView(hintRow(helper?"通知服务未连接，点此重试":"通知读取未授权，点击前往授权",
+                helper?v->{DuoNotifications.ensureBound();toast("正在重连通知服务…");}
+                    :v->start(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))));
             return;
         }
         List<DuoNotifications.Item> items=DuoNotifications.snapshot();
-        notifHead.setText(items.isEmpty()?"通知":(control?"通知 · ":"")+"通知 · "+items.size());
-        if(items.isEmpty()){notifBox.addView(hintRow("没有新通知",null));return;}
+        if(notifHead!=null)notifHead.setText(items.isEmpty()?"通知":"通知 · "+items.size());
+        if(items.isEmpty()){
+            TextView empty=HomeStyle.text(service,"没有新通知",14,MUTED);
+            empty.setGravity(Gravity.CENTER);
+            notifBox.addView(empty,new LinearLayout.LayoutParams(-1,dp(56)));
+        }
         for(DuoNotifications.Item item:items)notifBox.addView(notifCard(item));
     }
     private View hintRow(String text,View.OnClickListener action){
-        LinearLayout row=new LinearLayout(activity);row.setGravity(Gravity.CENTER_VERTICAL);row.setPadding(dp(12),dp(10),dp(12),dp(10));
-        row.setBackground(HomeStyle.surface(row,HomeStyle.FIELD,HomeStyle.FIELD_RADIUS));
-        TextView label=HomeStyle.text(activity,text,13,action==null?HomeStyle.MUTED:HomeStyle.ACCENT);
+        LinearLayout row=new LinearLayout(service);row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(14),dp(12),dp(14),dp(12));
+        row.setBackground(HomeStyle.surface(row,CARD,20));
+        TextView label=HomeStyle.text(service,text,13,action==null?MUTED:BLUE);
         row.addView(label,new LinearLayout.LayoutParams(0,-2,1));
         if(action!=null)row.setOnClickListener(action);
         return row;
     }
     private View notifCard(DuoNotifications.Item item){
-        LinearLayout card=new LinearLayout(activity);card.setOrientation(LinearLayout.HORIZONTAL);
-        card.setGravity(Gravity.CENTER_VERTICAL);card.setPadding(dp(11),dp(10),dp(11),dp(10));
-        card.setBackground(HomeStyle.surface(card,0x24ffffff,22));
-        LinearLayout.LayoutParams size=new LinearLayout.LayoutParams(-1,-2);size.topMargin=dp(7);
-        card.setLayoutParams(size);
-        ImageView icon=new ImageView(activity);
+        LinearLayout card=new LinearLayout(service);card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setGravity(Gravity.CENTER_VERTICAL);card.setPadding(dp(12),dp(11),dp(12),dp(11));
+        card.setBackground(HomeStyle.surface(card,CARD,20));
+        LinearLayout.LayoutParams size=new LinearLayout.LayoutParams(-1,-2);
+        size.bottomMargin=dp(8);card.setLayoutParams(size);
+        ImageView icon=new ImageView(service);
         icon.setImageBitmap(appIcon(item.packageName));
         icon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         card.addView(icon,new LinearLayout.LayoutParams(dp(38),dp(38)));
-        LinearLayout labels=new LinearLayout(activity);labels.setOrientation(LinearLayout.VERTICAL);labels.setPadding(dp(12),0,dp(8),0);
-        LinearLayout meta=new LinearLayout(activity);
-        TextView app=HomeStyle.text(activity,item.label,10,HomeStyle.MUTED);
+        LinearLayout labels=new LinearLayout(service);labels.setOrientation(LinearLayout.VERTICAL);
+        labels.setPadding(dp(12),0,dp(6),0);
+        LinearLayout meta=new LinearLayout(service);
+        TextView app=HomeStyle.text(service,item.label,11,MUTED);
         app.setSingleLine(true);app.setEllipsize(TextUtils.TruncateAt.END);
         meta.addView(app,new LinearLayout.LayoutParams(0,-2,1));
-        meta.addView(HomeStyle.text(activity,timeFormat.format(new Date(item.when)),10,HomeStyle.MUTED),new LinearLayout.LayoutParams(-2,-2));
-        labels.addView(meta,new LinearLayout.LayoutParams(-1,-2));
-        TextView title=HomeStyle.text(activity,item.title.isEmpty()?item.label:item.title,14,HomeStyle.TEXT);
-        title.setSingleLine(true);title.setEllipsize(TextUtils.TruncateAt.END);labels.addView(title);
-        TextView text=HomeStyle.text(activity,item.text,12,HomeStyle.MUTED);
-        text.setMaxLines(2);text.setEllipsize(TextUtils.TruncateAt.END);labels.addView(text);
+        meta.addView(HomeStyle.text(service,timeFormat.format(new Date(item.when)),11,MUTED),new LinearLayout.LayoutParams(-2,-2));
+        labels.addView(meta,new LinearLayout.LayoutParams(-1,dp(16)));
+        TextView title=HomeStyle.text(service,item.title.isEmpty()?item.label:item.title,15,TEXT);
+        title.setTypeface(MEDIUM);title.setSingleLine(true);title.setEllipsize(TextUtils.TruncateAt.END);
+        labels.addView(title,new LinearLayout.LayoutParams(-1,dp(22)));
+        TextView text=HomeStyle.text(service,item.text,13,MUTED);
+        text.setMaxLines(2);text.setEllipsize(TextUtils.TruncateAt.END);
+        labels.addView(text,new LinearLayout.LayoutParams(-1,-2));
         card.addView(labels,new LinearLayout.LayoutParams(0,-2,1));
-        card.setOnClickListener(v->{if(item.open(activity))sheet.dismiss();});
+        card.setOnClickListener(v->{if(item.open(service))close();});
         card.setOnLongClickListener(v->{DuoNotifications.cancel(item.key);return true;});
         return card;
     }
     private Bitmap appIcon(String packageName){
-        PackageManager packages=activity.getPackageManager();
+        PackageManager packages=service.getPackageManager();
         int pixels=dp(38);
         Bitmap bitmap=Bitmap.createBitmap(pixels,pixels,Bitmap.Config.ARGB_8888);
         try{Drawable drawable=packages.getApplicationIcon(packageName);drawable.setBounds(0,0,pixels,pixels);drawable.draw(new Canvas(bitmap));}
         catch(Exception unavailable){Drawable fallback=packages.getDefaultActivityIcon();fallback.setBounds(0,0,pixels,pixels);fallback.draw(new Canvas(bitmap));}
         return bitmap;
     }
+    private int dp(float value){return Math.round(value*service.getResources().getDisplayMetrics().density);}
 
-    /** Hand-drawn linear glyphs so tiles read like HyperOS without image assets. */
+    /**
+     * Shade gesture host following the SystemUI recipe:
+     * {@link android.view.VelocityTracker} with the platform minimum fling velocity
+     * decides flicks (real shades use ~50dp/s, not position math); the neutralized
+     * ScrollView lets the host grab at-top upward drags to carry the shade away;
+     * and a horizontal swipe starting at a screen edge acts like back and closes.
+     */
+    private final class PaneHost extends FrameLayout {
+        private static final byte UNDECIDED=0,FADE=1,DISMISS=2,VERTICAL=3;
+        private byte mode=UNDECIDED;
+        private float downX,downY,startFade,lastTouchY;
+        private boolean onList;
+        private android.view.VelocityTracker tracker;
+        private final int minFling=android.view.ViewConfiguration.get(service).getScaledMinimumFlingVelocity();
+        PaneHost(Context context){super(context);}
+        boolean dragging(){return mode==FADE||mode==DISMISS;}
+        void recycle(){if(tracker!=null){tracker.recycle();tracker=null;}}
+        private boolean listAtTop(){return notifList==null||notifList.getScrollY()<=2;}
+        private float velX(){if(tracker==null)return 0;tracker.computeCurrentVelocity(1000);return tracker.getXVelocity();}
+        private float velY(){if(tracker==null)return 0;tracker.computeCurrentVelocity(1000);return tracker.getYVelocity();}
+        @Override public boolean dispatchTouchEvent(MotionEvent event){
+            if(event.getActionMasked()==MotionEvent.ACTION_DOWN){
+                if(tracker==null)tracker=android.view.VelocityTracker.obtain();
+                tracker.clear();
+            }
+            if(tracker!=null)tracker.addMovement(event);
+            return super.dispatchTouchEvent(event);
+        }
+        private boolean edgeSwipe(float dx,float dy){
+            return (downX<dp(28)||downX>getWidth()-dp(28))&&Math.abs(dx)>dp(12)&&Math.abs(dx)>1.2f*Math.abs(dy);
+        }
+        @Override public boolean onInterceptTouchEvent(MotionEvent event){
+            switch(event.getActionMasked()){
+                case MotionEvent.ACTION_DOWN:
+                    downX=event.getX();downY=event.getY();lastTouchY=downY;startFade=fade;
+                    onList=overView(event,notifList);
+                    mode=overSlider(event)?VERTICAL:UNDECIDED;
+                    return false;
+                case MotionEvent.ACTION_MOVE:
+                    if(mode==UNDECIDED){
+                        float dx=event.getX()-downX,dy=event.getY()-downY;
+                        if(edgeSwipe(dx,dy)){close();mode=VERTICAL;return true;}
+                        if(Math.abs(dx)>dp(16)&&Math.abs(dx)>1.4f*Math.abs(dy)){
+                            mode=FADE;
+                            getParent().requestDisallowInterceptTouchEvent(true);
+                            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                            notifPane.setVisibility(View.VISIBLE);controlPane.setVisibility(View.VISIBLE);
+                            return true;
+                        }
+                        // Verticals: the control page and the empty grab-zone below the
+                        // list dismiss from anywhere; on the list itself only at its top.
+                        if(dy<-dp(14)&&-dy>1.4f*Math.abs(dx)&&(control||!onList||listAtTop())){
+                            mode=DISMISS;
+                            getParent().requestDisallowInterceptTouchEvent(true);
+                            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                            return true;
+                        }
+                        if(Math.abs(dy)>dp(22))mode=VERTICAL;
+                    }
+                    return false;
+                default:return false;
+            }
+        }
+        @Override public boolean onTouchEvent(MotionEvent event){
+            switch(event.getActionMasked()){
+                case MotionEvent.ACTION_DOWN:
+                    downX=event.getX();downY=event.getY();lastTouchY=downY;startFade=fade;
+                    onList=overView(event,notifList);
+                    mode=overSlider(event)?VERTICAL:UNDECIDED;
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    if(mode==UNDECIDED){
+                        float dx=event.getX()-downX,dy=event.getY()-downY;
+                        if(edgeSwipe(dx,dy)){close();mode=VERTICAL;return true;}
+                        if(Math.abs(dx)>dp(16)&&Math.abs(dx)>1.4f*Math.abs(dy)){
+                            mode=FADE;performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                            notifPane.setVisibility(View.VISIBLE);controlPane.setVisibility(View.VISIBLE);
+                        }else if(dy<-dp(14)&&-dy>1.4f*Math.abs(dx)&&(control||!onList||listAtTop())){
+                            mode=DISMISS;performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                        }
+                    }
+                    if(mode==FADE){
+                        float width=getWidth();
+                        fade=Math.max(0f,Math.min(1f,startFade-(event.getX()-downX)/(width*0.5f)));
+                        applyFade();
+                        return true;
+                    }
+                    if(mode==DISMISS){
+                        panel.setTranslationY(Math.max(-panel.getHeight()*0.6f,
+                            Math.min(0f,panel.getTranslationY()+(event.getY()-lastTouchY)*0.55f)));
+                        lastTouchY=event.getY();
+                        return true;
+                    }
+                    lastTouchY=event.getY();
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    if(mode==UNDECIDED){
+                        // Ultra-fast flicks may deliver no intermediate MOVE at all.
+                        float dx=event.getX()-downX,dy=event.getY()-downY;
+                        float width=getWidth();
+                        if(Math.abs(dx)>dp(40)&&Math.abs(dx)>1.4f*Math.abs(dy)&&width>0){
+                            mode=FADE;
+                            fade=Math.max(0f,Math.min(1f,startFade-dx/(width*0.5f)));
+                        }else if(dy<-dp(40)&&-dy>1.4f*Math.abs(dx)&&(control||!onList||listAtTop())){
+                            mode=DISMISS;
+                            panel.setTranslationY(dy*0.55f);
+                        }
+                    }
+                    if(mode==FADE){
+                        float width=getWidth();
+                        float vx=velX();
+                        boolean flick=Math.abs(vx)>=minFling&&Math.abs(event.getX()-downX)>dp(4);
+                        float projected=Math.max(0f,Math.min(1f,fade-vx*220f/(width*1000f)));
+                        boolean want=flick?vx<0:projected>=0.25f;
+                        animateFadeTo(want);
+                    }else if(mode==DISMISS){
+                        finishDismiss();
+                    }
+                    mode=UNDECIDED;
+                    return true;
+                default:return true;
+            }
+        }
+        private void finishDismiss(){
+            float raised=-panel.getTranslationY();
+            if(raised>panel.getHeight()*0.06f||velY()<=-minFling)close();
+            else panel.animate().translationY(0f).setDuration(200).start();
+        }
+        /** Sliders own their horizontal drags; never steal gestures starting on them. */
+        private boolean overSlider(MotionEvent event){
+            for(PillSlider slider:new PillSlider[]{brightnessSlider,volumeSlider})
+                if(overView(event,slider))return true;
+            return false;
+        }
+        private boolean overView(MotionEvent event,View view){
+            if(view==null||!view.isShown())return false;
+            int[] viewAt=new int[2],mine=new int[2];
+            view.getLocationOnScreen(viewAt);getLocationOnScreen(mine);
+            float x=event.getX()-(viewAt[0]-mine[0]),y=event.getY()-(viewAt[1]-mine[1]);
+            return x>=0&&y>=0&&x<=view.getWidth()&&y<=view.getHeight();
+        }
+    }
+
+    /** Dock-tinted glass that stays solid and melts to transparent over the last stretch. */
+    private static final class GlassFade extends android.graphics.drawable.Drawable {
+        private final int color;
+        private final int fadePixels;
+        private final Paint paint=new Paint();
+        GlassFade(int color,int fadePixels){this.color=color;this.fadePixels=fadePixels;}
+        @Override public void draw(Canvas canvas){
+            android.graphics.Rect bounds=getBounds();
+            if(bounds.height()<=0)return;
+            float stop=Math.max(0f,1f-fadePixels/(float)bounds.height());
+            paint.setShader(new android.graphics.LinearGradient(0,0,0,bounds.height(),
+                new int[]{color,color,color&0x00ffffff},new float[]{0f,stop,1f},android.graphics.Shader.TileMode.CLAMP));
+            canvas.drawRect(0,0,bounds.width(),bounds.height(),paint);
+        }
+        @Override public void setAlpha(int alpha){paint.setAlpha(alpha);}
+        @Override public void setColorFilter(android.graphics.ColorFilter filter){paint.setColorFilter(filter);}
+        @Override public int getOpacity(){return PixelFormat.TRANSLUCENT;}
+    }
+
+    /** Thick iOS-style pill slider: white fill with the glyph punched out (DST_OUT). */
+    private static final class PillSlider extends View {
+        private final boolean sun;
+        private final Paint fill=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint cutFill=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint cutStroke=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private float t;
+        private Consumer<Float> change;
+        PillSlider(Context context,boolean sun){
+            super(context);this.sun=sun;
+            cutStroke.setStrokeWidth(1.8f);cutStroke.setStyle(Paint.Style.STROKE);
+            cutStroke.setStrokeCap(Paint.Cap.ROUND);
+            setClickable(true);
+        }
+        void setValue(float value){t=Math.max(0f,Math.min(1f,value));invalidate();}
+        void setChange(Consumer<Float> action){change=action;}
+        private int dp(float value){return Math.round(value*getResources().getDisplayMetrics().density);}
+        @Override public boolean onTouchEvent(MotionEvent event){
+            if(!isEnabled())return false;
+            switch(event.getActionMasked()){
+                case MotionEvent.ACTION_DOWN:performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                case MotionEvent.ACTION_MOVE:{
+                    float start=dp(48),usable=getWidth()-start-dp(16);
+                    float value=Math.max(0f,Math.min(1f,(event.getX()-start)/usable));
+                    if(value!=t){t=value;invalidate();if(change!=null)change.accept(t);}
+                    return true;
+                }
+                default:return true;
+            }
+        }
+        @Override protected void onDraw(Canvas canvas){
+            float width=getWidth(),height=getHeight(),radius=height/2f;
+            fill.setColor(isEnabled()?0x2ef2f2f7:0x1af2f2f7);
+            canvas.drawRoundRect(0,0,width,height,radius,radius,fill);
+            float start=dp(48);
+            float end=start+t*(width-start-dp(16));
+            if(end>start){
+                int layer=canvas.saveLayer(0,0,width,height,null);
+                fill.setColor(0xe6f2f2f7);
+                canvas.drawRoundRect(0,0,end,height,radius,radius,fill);
+                cutFill.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.DST_OUT));
+                cutStroke.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.DST_OUT));
+                float scale=dp(20)/24f;
+                canvas.save();
+                canvas.translate(dp(14),(height-dp(20))/2f);
+                canvas.scale(scale,scale);
+                if(sun)drawSun(canvas);else drawSpeaker(canvas);
+                canvas.restore();
+                cutFill.setXfermode(null);cutStroke.setXfermode(null);
+                canvas.restoreToCount(layer);
+            }
+        }
+        private void drawSun(Canvas canvas){
+            cutFill.setStyle(Paint.Style.FILL);
+            canvas.drawCircle(12,12,3.7f,cutFill);
+            for(int ray=0;ray<8;ray++){
+                double angle=Math.toRadians(ray*45);
+                canvas.drawLine(12+(float)Math.cos(angle)*5.6f,12+(float)Math.sin(angle)*5.6f,
+                    12+(float)Math.cos(angle)*8.1f,12+(float)Math.sin(angle)*8.1f,cutStroke);
+            }
+        }
+        private void drawSpeaker(Canvas canvas){
+            Path body=new Path();
+            body.moveTo(4,9.6f);body.lineTo(7.6f,9.6f);body.lineTo(12,5.4f);body.lineTo(12,18.6f);
+            body.lineTo(7.6f,14.4f);body.lineTo(4,14.4f);body.close();
+            cutFill.setStyle(Paint.Style.FILL);
+            canvas.drawPath(body,cutFill);
+            canvas.drawArc(13.4f,7f,19.4f,17f,-46f,92f,false,cutStroke);
+            canvas.drawArc(14.6f,3.6f,22.4f,20.4f,-42f,84f,false,cutStroke);
+        }
+    }
+
+    /** Linear 24-grid glyphs so toggles read like iOS symbols without image assets. */
     private static final class TileIcon extends View {
-        static final int TORCH=0,ROTATE=1,DND=2,DARK=3;
+        static final int TORCH=0,ROTATE=1,DND=2,DARK=3,WIFI=4,BLUETOOTH=5,CELL=6,AIRPLANE=7,GEAR=8;
         private final int type;
         private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
-        private int color=HomeStyle.TEXT;
+        private int color=0xfff2f2f7;
         TileIcon(Context context,int type){super(context);this.type=type;
             paint.setStrokeWidth(1.7f);paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeCap(Paint.Cap.ROUND);paint.setStrokeJoin(Paint.Join.ROUND);}
@@ -299,15 +849,71 @@ final class HomeControlPanel {
                     break;
                 }
                 case DND:{
-                    canvas.drawCircle(12f,12f,8.2f,paint);
-                    canvas.drawLine(6.8f,12f,17.2f,12f,paint);
+                    // iOS crescent moon: filled circle with an offset circle punched out.
+                    int layer=canvas.saveLayer(0,0,24,24,null);
+                    paint.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(12,12,8.4f,paint);
+                    paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.DST_OUT));
+                    canvas.drawCircle(15.8f,9.4f,7.6f,paint);
+                    paint.setXfermode(null);
+                    canvas.restoreToCount(layer);
+                    paint.setStyle(Paint.Style.STROKE);
                     break;
                 }
                 case DARK:{
-                    canvas.drawCircle(12f,12f,8.2f,paint);
+                    canvas.drawCircle(12,12,8.2f,paint);
                     paint.setStyle(Paint.Style.FILL);
                     Path half=new Path();half.addArc(3.8f,3.8f,20.2f,20.2f,-90f,180f);half.close();
                     canvas.drawPath(half,paint);
+                    break;
+                }
+                case WIFI:{
+                    paint.setStrokeWidth(1.9f);
+                    canvas.drawArc(4.5f,9f,19.5f,24f,-135f,90f,false,paint);
+                    canvas.drawArc(7f,11.5f,17f,21.5f,-135f,90f,false,paint);
+                    canvas.drawArc(9.5f,14f,14.5f,19f,-135f,90f,false,paint);
+                    paint.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(12,16.5f,1.3f,paint);
+                    break;
+                }
+                case BLUETOOTH:{
+                    Path rune=new Path();
+                    rune.moveTo(12,2.6f);rune.lineTo(12,21.4f);
+                    rune.moveTo(12,2.6f);rune.lineTo(16.6f,7.2f);rune.lineTo(12,11.8f);
+                    rune.lineTo(16.6f,16.6f);rune.lineTo(12,21.4f);
+                    rune.moveTo(12,11.8f);rune.lineTo(7.4f,16.4f);
+                    canvas.drawPath(rune,paint);
+                    break;
+                }
+                case CELL:{
+                    paint.setStrokeWidth(2.6f);
+                    canvas.drawLine(5.2f,19f,5.2f,14.5f,paint);
+                    canvas.drawLine(9.8f,19f,9.8f,10.5f,paint);
+                    canvas.drawLine(14.2f,19f,14.2f,6.5f,paint);
+                    canvas.drawLine(18.8f,19f,18.8f,2.5f,paint);
+                    break;
+                }
+                case AIRPLANE:{
+                    paint.setStyle(Paint.Style.FILL);
+                    Path plane=new Path();
+                    plane.moveTo(12,2.4f);
+                    plane.lineTo(13.4f,8.2f);plane.lineTo(21,12.6f);plane.lineTo(21,14.6f);
+                    plane.lineTo(13.4f,12.4f);plane.lineTo(13.2f,17.8f);plane.lineTo(15.8f,20.2f);
+                    plane.lineTo(15.8f,21.6f);plane.lineTo(12,20.4f);plane.lineTo(8.2f,21.6f);
+                    plane.lineTo(8.2f,20.2f);plane.lineTo(10.8f,17.8f);plane.lineTo(10.6f,12.4f);
+                    plane.lineTo(3,14.6f);plane.lineTo(3,12.6f);plane.lineTo(10.6f,8.2f);
+                    plane.close();
+                    canvas.drawPath(plane,paint);
+                    break;
+                }
+                case GEAR:{
+                    canvas.drawCircle(12,12,6.6f,paint);
+                    canvas.drawCircle(12,12,2.9f,paint);
+                    for(int tooth=0;tooth<8;tooth++){
+                        double angle=Math.toRadians(tooth*45+22.5);
+                        canvas.drawLine(12+(float)Math.cos(angle)*7.6f,12+(float)Math.sin(angle)*7.6f,
+                            12+(float)Math.cos(angle)*10.6f,12+(float)Math.sin(angle)*10.6f,paint);
+                    }
                     break;
                 }
             }
