@@ -585,8 +585,7 @@ final class HomeControlPanel {
      * Shade gesture host following the SystemUI recipe:
      * {@link android.view.VelocityTracker} with the platform minimum fling velocity
      * decides flicks (real shades use ~50dp/s, not position math); the neutralized
-     * ScrollView lets the host grab at-top upward drags to carry the shade away;
-     * and a horizontal swipe starting at a screen edge acts like back and closes.
+     * ScrollView lets the host grab at-top upward drags to carry the shade away.
      */
     private final class PaneHost extends FrameLayout {
         private static final byte UNDECIDED=0,FADE=1,DISMISS=2,VERTICAL=3;
@@ -609,9 +608,6 @@ final class HomeControlPanel {
             if(tracker!=null)tracker.addMovement(event);
             return super.dispatchTouchEvent(event);
         }
-        private boolean edgeSwipe(float dx,float dy){
-            return (downX<dp(28)||downX>getWidth()-dp(28))&&Math.abs(dx)>dp(12)&&Math.abs(dx)>1.2f*Math.abs(dy);
-        }
         @Override public boolean onInterceptTouchEvent(MotionEvent event){
             switch(event.getActionMasked()){
                 case MotionEvent.ACTION_DOWN:
@@ -622,7 +618,6 @@ final class HomeControlPanel {
                 case MotionEvent.ACTION_MOVE:
                     if(mode==UNDECIDED){
                         float dx=event.getX()-downX,dy=event.getY()-downY;
-                        if(edgeSwipe(dx,dy)){close();mode=VERTICAL;return true;}
                         if(Math.abs(dx)>dp(16)&&Math.abs(dx)>1.4f*Math.abs(dy)){
                             mode=FADE;
                             getParent().requestDisallowInterceptTouchEvent(true);
@@ -654,7 +649,6 @@ final class HomeControlPanel {
                 case MotionEvent.ACTION_MOVE:
                     if(mode==UNDECIDED){
                         float dx=event.getX()-downX,dy=event.getY()-downY;
-                        if(edgeSwipe(dx,dy)){close();mode=VERTICAL;return true;}
                         if(Math.abs(dx)>dp(16)&&Math.abs(dx)>1.4f*Math.abs(dy)){
                             mode=FADE;performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
                             notifPane.setVisibility(View.VISIBLE);controlPane.setVisibility(View.VISIBLE);

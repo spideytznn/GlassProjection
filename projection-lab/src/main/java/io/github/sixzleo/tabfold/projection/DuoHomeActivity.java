@@ -137,6 +137,9 @@ public class DuoHomeActivity extends Activity {
     @Override protected void onStop(){widgets.stop();super.onStop();}
     @Override protected void onDestroy(){
         homeInstances.remove(this);
+        // When the desktop itself dies, its display's touch strip must go too —
+        // otherwise we hijack the native shade after the user leaves our home.
+        ProjectionService.removeShadeBar(this);
         if(dualPanel())panelActivities.remove(getDisplay().getDisplayId(),this);
         widgets.close();
         try{unregisterReceiver(shadeDebug);}catch(IllegalArgumentException ignored){}

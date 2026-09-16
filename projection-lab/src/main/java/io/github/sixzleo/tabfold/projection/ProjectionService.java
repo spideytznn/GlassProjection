@@ -360,7 +360,15 @@ public final class ProjectionService extends AccessibilityService implements Sen
     }
     static void refreshHomeScope(){
         ProjectionService s=instance;
-        if(s!=null)s.main.post(()->{s.refreshHomes(true);s.appScopeDirty=true;s.update();});
+        if(s!=null)s.main.post(()->{
+            // The shade strips are part of OUR desktop experience. When the user
+            // defaults to another launcher, get out of the way of the native shade.
+            boolean ownHome=s.getSystemService(android.app.role.RoleManager.class)!=null
+                &&s.getSystemService(android.app.role.RoleManager.class).isRoleHeld(android.app.role.RoleManager.ROLE_HOME);
+            if(!ownHome&&!shadeHosts.isEmpty())
+                for(Integer id:new java.util.ArrayList<>(shadeBars.keySet()))removeShadeBarAt(id);
+            s.refreshHomes(true);s.appScopeDirty=true;s.update();
+        });
     }
     private void refreshHomes(boolean force){
         long now=SystemClock.uptimeMillis();if(!force&&now-homesResolvedAt<2000)return;homesResolvedAt=now;
