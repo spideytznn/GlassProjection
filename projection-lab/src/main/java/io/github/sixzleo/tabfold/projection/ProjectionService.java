@@ -206,15 +206,11 @@ public final class ProjectionService extends AccessibilityService implements Sen
     private static final java.util.Map<Integer,View> shadeBars=new java.util.HashMap<>();
     private static final java.util.Map<Integer,WindowManager> shadeWindows=new java.util.HashMap<>();
     private static final java.util.Map<Integer,DuoHomeActivity> shadeHosts=new java.util.HashMap<>();
-    private static boolean shadeCountObserved;
-    static void updateShadeBar(DuoHomeActivity host){
+    static void updateShadeBar(DuoHomeActivity host){updateShadeBar(host,0);}
+    private static void updateShadeBar(DuoHomeActivity host,int attempt){
         ProjectionService s=instance;if(s==null||host==null||host.isDestroyed())return;
+        if(attempt>0&&!host.shadeAlive())return;
         s.main.post(()->{
-            if(!shadeCountObserved){
-                shadeCountObserved=true;
-                DuoNotifications.observe(()->{int count=DuoNotifications.snapshot().size();
-                    for(View bar:shadeBars.values())if(bar instanceof HomeStatusBar)((HomeStatusBar)bar).setNotificationCount(count);});
-            }
             android.view.Display display=host.getDisplay();if(display==null)return;
             int id=display.getDisplayId();
             removeShadeBarAt(id);
@@ -223,18 +219,21 @@ public final class ProjectionService extends AccessibilityService implements Sen
             int strip=wc.getSystemService(WindowManager.class).getCurrentWindowMetrics()
                 .getWindowInsets().getInsets(WindowInsets.Type.statusBars()).top;
             if(strip<=0||strip>Math.round(80*wc.getResources().getDisplayMetrics().density))strip=Math.round(28*wc.getResources().getDisplayMetrics().density);
-            HomeStatusBar bar=new HomeStatusBar(wc,side->{
-                DuoHomeActivity target=shadeHosts.get(id);
-                if(target!=null&&!target.isDestroyed())target.openShade(side);
-            });
-            bar.setNotificationCount(DuoNotifications.snapshot().size());
+            HomeStatusBar bar=new HomeStatusBar(wc,side->HomeControlPanel.open(id,side==HomeStatusBar.SIDE_CONTROL));
             WindowManager.LayoutParams p=new WindowManager.LayoutParams(-1,strip,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                     |WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,android.graphics.PixelFormat.TRANSLUCENT);
             p.gravity=Gravity.TOP|Gravity.LEFT;p.setFitInsetsTypes(0);
             p.layoutInDisplayCutoutMode=WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
             p.setTitle("Duo home bar");
-            try{wm.addView(bar,p);}catch(RuntimeException failed){Log.w("GlassHome","Shade bar overlay unavailable",failed);return;}
+            try{wm.addView(bar,p);}
+            catch(RuntimeException failed){
+                // Display teardown/recreation can reject the add transiently; retry a few
+                // times instead of leaving the panel barless until the next focus change.
+                Log.w("GlassHome","Shade bar overlay unavailable",failed);
+                if(attempt<3)s.main.postDelayed(()->updateShadeBar(host,attempt+1),2000);
+                return;
+            }
             shadeBars.put(id,bar);shadeWindows.put(id,wm);shadeHosts.put(id,host);
         });
     }
@@ -319,6 +318,13 @@ public final class ProjectionService extends AccessibilityService implements Sen
         displays.registerDisplayListener(displayListener,main);status="已开启，等待桌面";main.post(tick);
         Log.i("ProjectionDesktop","CONNECTED homes="+homes+" physicalFold="+(physicalFoldSensor!=null)+" directContact="+(directContactSensor!=null));
         MobileHelper.start(this);
+        // Activities that resumed before the accessibility connection still lack their
+        // overlay bar (updateShadeBar needs instance); focus-change retries are not
+        // guaranteed, so re-apply for every resumed panel once connected.
+        main.post(DuoHomeActivity::refreshShadeBars);
+        // Package replaces often leave the notification listener granted but unbound;
+        // give the system a moment to bind by itself, then force a rebind via the helper.
+        main.postDelayed(DuoNotifications::ensureBound,8000);
 
     }
     private boolean home() {

@@ -35,6 +35,20 @@ public final class DuoNotifications extends NotificationListenerService {
     private static final Handler main=new Handler(Looper.getMainLooper());
     static List<Item> snapshot(){return items;}
     static boolean available(){return connected&&instance!=null;}
+    /**
+     * After a package replace HyperOS keeps the grant but often leaves the listener
+     * unbound (ServiceRecord app=null). Re-granting through the shell helper forces
+     * an immediate rebind; onListenerConnected then refreshes observers by itself.
+     */
+    static void ensureBound(){
+        if(connected)return;
+        if(!MobileHelper.ready())return;
+        String cn="io.github.sixzleo.tabfold.projection/io.github.sixzleo.tabfold.projection.DuoNotifications";
+        MobileHelper.svc("cmd notification disallow_listener "+cn,out->{
+            if(!out.startsWith("ERROR"))
+                MobileHelper.svc("cmd notification allow_listener "+cn,ignored->{});
+        });
+    }
     static void observe(Runnable change){observers.add(change);notifyChange();}
     static void forget(Runnable change){observers.remove(change);}
     static void cancel(String key){

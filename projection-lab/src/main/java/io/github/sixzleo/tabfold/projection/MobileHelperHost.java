@@ -55,6 +55,20 @@ public final class MobileHelperHost extends IHelperHost.Stub {
         }catch(IOException e){android.util.Log.e("MobileHelperHost","start",e);return 0;}
     }
     @Override public synchronized void stopHelpers(){caller();stop();}
+    /** Restricted shell passthrough for system toggles: only svc/cmd/settings prefixes. */
+    @Override public synchronized String svc(String command){
+        caller();
+        boolean allowed=command.startsWith("svc ")||command.startsWith("cmd ")||command.startsWith("settings ")||command.startsWith("input ");
+        boolean chained=command.contains(";")||command.contains("&&")||command.contains("|")||command.contains("\n")||command.contains("`");
+        if(!allowed||chained)return "ERROR disallowed";
+        try{
+            java.lang.Process process=new ProcessBuilder("sh","-c",command).redirectErrorStream(true).start();
+            byte[] output;try(java.io.InputStream in=process.getInputStream()){output=in.readAllBytes();}
+            process.waitFor();
+            String text=new String(output).trim();
+            return text.isEmpty()?"OK":text;
+        }catch(Exception e){return "ERROR "+e;}
+    }
     private void stop(){
         releaseFixedState();
         running=false;

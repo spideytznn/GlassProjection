@@ -77,6 +77,9 @@ final class FixedDualOutput implements TextureView.SurfaceTextureListener,AutoCl
         f.gravity=Gravity.TOP|Gravity.LEFT;f.setFitInsetsTypes(0);
         f.layoutInDisplayCutoutMode=WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
         f.setTitle("Duo "+(inner?"inner":"cover")+" touch forward");manager.addView(forwarder,f);
+        // Mirror windows stack above an existing bar (same overlay type, add-order z):
+        // re-apply bars so they stay visible on top of the output surface.
+        root.post(DuoHomeActivity::refreshShadeBars);
     }
     void frame(float angle,boolean block){
         if(closed)return;

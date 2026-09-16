@@ -23,7 +23,7 @@ final class MobileHelper {
     };
     static void init(Context c){
         if(initialized)return;initialized=true;context=c.getApplicationContext();
-        arguments=new Shizuku.UserServiceArgs(new ComponentName(context,MobileHelperHost.class)).daemon(true).processNameSuffix("glass_helpers").tag("glass_helpers").version(30);
+        arguments=new Shizuku.UserServiceArgs(new ComponentName(context,MobileHelperHost.class)).daemon(true).processNameSuffix("glass_helpers").tag("glass_helpers").version(32);
         Shizuku.addBinderReceivedListenerSticky(()->{if(!prefersWireless()){message="Shizuku 已启动";schedule();}});
         Shizuku.addBinderDeadListener(()->{if(!wirelessHost&&!prefersWireless()){host=null;binding=false;message="Shizuku 已停止，请在手机上重新启动";}});
         Shizuku.addRequestPermissionResultListener((code,result)->{if(code==312){message=result==PackageManager.PERMISSION_GRANTED?"已授权，正在连接":"未授予 Shizuku 权限";schedule();}});
@@ -84,6 +84,23 @@ final class MobileHelper {
         worker.execute(()->{try{if(current!=null)current.dualTouch(id,copy);}catch(Exception ignored){}finally{copy.recycle();}});
     }
     static void dualKey(int id,int key){IHelperHost current=host;worker.execute(()->{try{if(current!=null)current.dualKey(id,key);}catch(Exception ignored){}});}
+    /** Runs one restricted shell command on the helper; result is delivered on the main thread. */
+    static void svc(String command,java.util.function.Consumer<String> result){
+        IHelperHost current=host;
+        worker.execute(()->{
+            String value;
+            try{value=current==null?"ERROR helper unavailable":current.svc(command);}
+            catch(Exception e){value="ERROR "+e;}
+            final String out=value;
+            main.post(()->result.accept(out));
+        });
+    }
+    /** Synchronous variant for background threads (migration gestures and the like). */
+    static String svcSync(String command){
+        IHelperHost current=host;
+        try{return current==null?"ERROR helper unavailable":current.svc(command);}
+        catch(Exception e){return "ERROR "+e;}
+    }
     private static void schedule(){main.removeCallbacks(tick);main.post(tick);}
     private static final Runnable tick=new Runnable(){public void run(){
         if(!active&&!prepared)return;

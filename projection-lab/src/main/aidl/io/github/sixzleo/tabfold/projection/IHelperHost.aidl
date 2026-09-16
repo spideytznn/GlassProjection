@@ -14,5 +14,6 @@ interface IHelperHost {
     void dualTouch(int displayId, in MotionEvent event) = 9;
     void dualKey(int displayId, int keyCode) = 10;
     Bundle dualContact() = 11;
+    String svc(String command) = 12;
     void destroy() = 16777114;
 }
