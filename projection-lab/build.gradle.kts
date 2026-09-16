@@ -7,8 +7,8 @@ android {
         applicationId = "io.github.sixzleo.tabfold.projection"
         minSdk = 33
         targetSdk = 35
-        versionCode = 95
-        versionName = "0.5.0-preview.8"
+        versionCode = 96
+        versionName = "0.5.0-preview.9"
         testInstrumentationRunner = "io.github.sixzleo.tabfold.projection.HomeSmoke"
     }
     compileOptions {
