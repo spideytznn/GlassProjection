@@ -20,6 +20,7 @@ import android.text.TextUtils;
 final class HomeSheet extends Dialog {
     final LinearLayout content;
     private final FrameLayout outside;
+    private final View scrim;
     private final int preferredWidth,preferredHeight;
     private LinearLayout heading;
     private boolean keyboardVisible;
@@ -33,6 +34,9 @@ final class HomeSheet extends Dialog {
         content.setBackground(HomeStyle.surface(content,0xee252b32,HomeStyle.PANEL_RADIUS));
         HomeGlass.apply(content,dp(32),dp(28));
         outside.addView(content,new FrameLayout.LayoutParams(preferredWidth,preferredHeight,Gravity.CENTER));
+        scrim=new View(activity);scrim.setBackgroundColor(0x52000000);
+        scrim.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        outside.addView(scrim,0,new FrameLayout.LayoutParams(-1,-1));
         setContentView(outside);
         Window window=getWindow();window.setDecorFitsSystemWindows(false);
         window.setStatusBarColor(Color.TRANSPARENT);window.setNavigationBarColor(Color.TRANSPARENT);
@@ -47,6 +51,11 @@ final class HomeSheet extends Dialog {
     }
     @Override public void show(){
         super.show();getWindow().setLayout(-1,-1);outside.requestApplyInsets();
+        scrim.setAlpha(0f);content.setAlpha(0f);content.setScaleX(.94f);content.setScaleY(.94f);content.setTranslationY(dp(14));
+        if(!android.animation.ValueAnimator.areAnimatorsEnabled())return;
+        scrim.animate().alpha(1f).setDuration(240).start();
+        content.animate().alpha(1f).scaleX(1f).scaleY(1f).translationY(0).setDuration(240)
+            .setInterpolator(new android.view.animation.PathInterpolator(.2f,0f,0f,1f)).start();
     }
     LinearLayout header(String title){
         LinearLayout header=new LinearLayout(getContext());header.setGravity(Gravity.CENTER_VERTICAL);

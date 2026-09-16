@@ -202,6 +202,50 @@ public final class ProjectionService extends AccessibilityService implements Sen
         public void onDisplayAdded(int id){update();} public void onDisplayRemoved(int id){update();} public void onDisplayChanged(int id){update();}
     };
     static void refreshGestureNavigation(){ProjectionService service=instance;if(service!=null)service.main.post(()->{if(service.gestureNavigation!=null)service.gestureNavigation.refresh();});}
+    /** Home-drawn status bars per display: the accessibility overlay (layer 311000) covers the dormant MIUI bar (151000). */
+    private static final java.util.Map<Integer,View> shadeBars=new java.util.HashMap<>();
+    private static final java.util.Map<Integer,WindowManager> shadeWindows=new java.util.HashMap<>();
+    private static final java.util.Map<Integer,DuoHomeActivity> shadeHosts=new java.util.HashMap<>();
+    private static boolean shadeCountObserved;
+    static void updateShadeBar(DuoHomeActivity host){
+        ProjectionService s=instance;if(s==null||host==null||host.isDestroyed())return;
+        s.main.post(()->{
+            if(!shadeCountObserved){
+                shadeCountObserved=true;
+                DuoNotifications.observe(()->{int count=DuoNotifications.snapshot().size();
+                    for(View bar:shadeBars.values())if(bar instanceof HomeStatusBar)((HomeStatusBar)bar).setNotificationCount(count);});
+            }
+            android.view.Display display=host.getDisplay();if(display==null)return;
+            int id=display.getDisplayId();
+            removeShadeBarAt(id);
+            Context wc=s.createDisplayContext(display).createWindowContext(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,null);
+            WindowManager wm=wc.getSystemService(WindowManager.class);
+            int strip=wc.getSystemService(WindowManager.class).getCurrentWindowMetrics()
+                .getWindowInsets().getInsets(WindowInsets.Type.statusBars()).top;
+            if(strip<=0||strip>Math.round(80*wc.getResources().getDisplayMetrics().density))strip=Math.round(28*wc.getResources().getDisplayMetrics().density);
+            HomeStatusBar bar=new HomeStatusBar(wc,side->{
+                DuoHomeActivity target=shadeHosts.get(id);
+                if(target!=null&&!target.isDestroyed())target.openShade(side);
+            });
+            bar.setNotificationCount(DuoNotifications.snapshot().size());
+            WindowManager.LayoutParams p=new WindowManager.LayoutParams(-1,strip,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                    |WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,android.graphics.PixelFormat.TRANSLUCENT);
+            p.gravity=Gravity.TOP|Gravity.LEFT;p.setFitInsetsTypes(0);
+            p.layoutInDisplayCutoutMode=WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+            p.setTitle("Duo home bar");
+            try{wm.addView(bar,p);}catch(RuntimeException failed){Log.w("GlassHome","Shade bar overlay unavailable",failed);return;}
+            shadeBars.put(id,bar);shadeWindows.put(id,wm);shadeHosts.put(id,host);
+        });
+    }
+    static void removeShadeBar(DuoHomeActivity host){
+        ProjectionService s=instance;if(s==null||host==null)return;
+        s.main.post(()->{for(Integer id:new java.util.ArrayList<>(shadeHosts.keySet()))if(shadeHosts.get(id)==host)removeShadeBarAt(id);});
+    }
+    private static void removeShadeBarAt(int id){
+        View bar=shadeBars.remove(id);WindowManager wm=shadeWindows.remove(id);shadeHosts.remove(id);
+        if(bar!=null&&wm!=null)try{wm.removeViewImmediate(bar);}catch(IllegalArgumentException ignored){}
+    }
     static void recentsRequested(){ProjectionService service=instance;if(service!=null){service.recentsRequestedAt=SystemClock.uptimeMillis();service.recentsWindowId=-1;}}
     static boolean recentsVisible(){
         ProjectionService service=instance;if(service==null)return false;

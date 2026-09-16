@@ -31,8 +31,7 @@ public final class AppBlacklistActivity extends Activity {
     private final LruCache<String,Bitmap> icons=new LruCache<>(32);
     private final Set<String> pendingIcons=new HashSet<>();
     private Drawable defaultIcon;
-    private TextView count,empty;
-    private EditText search;
+    private HomeSearchList<App> searchList;
     private boolean loaded;
     private int dp(int n){return Math.round(n*getResources().getDisplayMetrics().density);}
     private static final class App {
@@ -54,25 +53,23 @@ public final class AppBlacklistActivity extends Activity {
         TextView title=text("应用黑名单",26,TEXT);page.addView(title);
         TextView help=text("选中后，该应用前台运行时不显示投影或交接淡入淡出。离开后自动恢复，选择自动保存。",14,MUTED);
         help.setPadding(0,dp(10),0,dp(12));page.addView(help);
-        search=new EditText(this);search.setSingleLine(true);search.setTextColor(TEXT);search.setHintTextColor(MUTED);
-        search.setHint("搜索应用名称或包名");search.setContentDescription("搜索应用名称或包名");
-        page.addView(search,new LinearLayout.LayoutParams(-1,dp(56)));
-        count=text("正在加载应用…",13,ACCENT);count.setPadding(0,dp(12),0,dp(10));page.addView(count);
-        FrameLayout results=new FrameLayout(this);page.addView(results,new LinearLayout.LayoutParams(-1,0,1));
-        ListView list=new ListView(this);list.setDividerHeight(dp(1));list.setAdapter(adapter);
-        results.addView(list,new FrameLayout.LayoutParams(-1,-1));
-        empty=text("正在加载应用…",15,MUTED);empty.setGravity(Gravity.CENTER);results.addView(empty,new FrameLayout.LayoutParams(-1,-1));list.setEmptyView(empty);
-        list.setOnItemClickListener((parent,view,position,id)->{
-            App app=visible.get(position);
+        searchList=new HomeSearchList<>(this,"blacklist-query","blacklist-results","blacklist-empty","搜索应用名称或包名");
+        searchList.query.setContentDescription("搜索应用名称或包名");
+        searchList.count.setTextColor(ACCENT);
+        searchList.filter=this::filter;
+        page.addView(searchList,new LinearLayout.LayoutParams(-1,0,1));
+        searchList.list.setAdapter(adapter);
+        searchList.list.setOnItemClickListener((parent,view,position,id)->{
+            App app=searchList.visible.get(position);
             AnimationSettings.blacklist(app.pkg,!AnimationSettings.blacklistedApps.contains(app.pkg));
             adapter.notifyDataSetChanged();updateCount();
         });
-        search.addTextChangedListener(new TextWatcher(){
-            public void beforeTextChanged(CharSequence s,int start,int count,int after){}
-            public void onTextChanged(CharSequence s,int start,int before,int count){filter();}
-            public void afterTextChanged(Editable s){}
+        searchList.query.setOnEditorActionListener((v,action,event)->{
+            if(action!=android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH)return false;
+            android.view.WindowInsetsController controller=searchList.query.getWindowInsetsController();
+            if(controller!=null)controller.hide(WindowInsets.Type.ime());return true;
         });
-        if(saved!=null)search.setText(saved.getString("query",""));
+        if(saved!=null)searchList.query.setText(saved.getString("query",""));
         Set<String> selected=new HashSet<>(AnimationSettings.blacklistedApps);
         loader.execute(()->{
             try{
@@ -95,18 +92,18 @@ public final class AppBlacklistActivity extends Activity {
                     if(order==0)order=collator.compare(a.label,b.label);return order!=0?order:a.pkg.compareTo(b.pkg);});
                 runOnUiThread(()->{if(isDestroyed()||isFinishing())return;apps.addAll(result);loaded=true;filter();});
             }catch(RuntimeException failure){
-                runOnUiThread(()->{if(isDestroyed()||isFinishing())return;count.setText("应用列表加载失败");empty.setText("请返回后重试");});
+                runOnUiThread(()->{if(isDestroyed()||isFinishing())return;searchList.count.setText("应用列表加载失败");searchList.empty.setText("请返回后重试");});
             }
         });
         page.requestApplyInsets();
     }
     private void filter(){
-        String query=search.getText().toString().trim().toLowerCase(Locale.ROOT);
+        String query=searchList.query.getText().toString().trim().toLowerCase(Locale.ROOT);
         visible.clear();for(App app:apps)if(app.search.contains(query))visible.add(app);
         adapter.notifyDataSetChanged();
-        if(loaded){empty.setText("没有匹配的应用");updateCount();}
+        if(loaded){searchList.empty.setText("没有匹配的应用");updateCount();}
     }
-    private void updateCount(){count.setText("已选 "+AnimationSettings.blacklistedApps.size()+" 个 · 显示 "+visible.size()+" 个应用");}
+    private void updateCount(){searchList.count.setText("已选 "+AnimationSettings.blacklistedApps.size()+" 个 · 显示 "+visible.size()+" 个应用");}
     private TextView text(String value,int size,int color){TextView view=new TextView(this);view.setText(value);view.setTextSize(size);view.setTextColor(color);return view;}
     private void loadIcon(String pkg){
         if(loader.isShutdown()||pendingIcons.size()>=12||!pendingIcons.add(pkg))return;
@@ -152,6 +149,6 @@ public final class AppBlacklistActivity extends Activity {
             return recycled;
         }
     }
-    @Override public void onSaveInstanceState(Bundle out){out.putString("query",search.getText().toString());super.onSaveInstanceState(out);}
+    @Override public void onSaveInstanceState(Bundle out){out.putString("query",searchList.query.getText().toString());super.onSaveInstanceState(out);}
     @Override public void onDestroy(){loader.shutdownNow();super.onDestroy();}
 }

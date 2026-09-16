@@ -18,7 +18,7 @@ def main():
     source = ROOT / "projection-lab/src/main/java" / package.replace(".", "/")
     files = [source / f"{name}.java" for name in ("FixedDualPolicy", "ProjectionMath", "ProjectionEntrance", "ProjectionAngleMotion", "ProjectionSceneTiming", "AdaptiveAngleFollow", "FrameUpdateOrder", "ProjectionCadence", "CoverBlackout", "ScreenFade", "CoverLayoutReady", "FrameGate", "LockScreenGate", "FoldHoldGate", "FingerSwipeGate", "NavigationGestureGate", "FoldPose")]
     files += [ROOT / "tools/helpers/EarlyDisplayModel.java", ROOT / "tools/helpers/FoldReturnMotion.java", ROOT / "tools/helpers/RenderIdleGate.java", ROOT / "tools/helpers/RenderWakeSignal.java", ROOT / "tools/helpers/RenderDrawGate.java"]
-    files += [source / name for name in ("AppBlacklist.java", "UpdateTrust.java", "UpdateTransport.java", "ResumableUpdate.java", "HomeLayout.java", "HomeWidgetResize.java")]
+    files += [source / name for name in ("AppBlacklist.java", "UpdateTrust.java", "UpdateTransport.java", "ResumableUpdate.java", "HomeLayout.java", "HomeWidgetResize.java", "FolderFan.java")]
     files += sorted((ROOT / "tools/tests").glob("*.java"))
     build = ROOT / "build"
     build.mkdir(exist_ok=True)
@@ -33,6 +33,7 @@ def main():
         subprocess.run([str(java), "-cp", output, package + ".ResumeDownloadTest"], check=True)
         subprocess.run([str(java), "-cp", output, package + ".HomeLayoutTest"], check=True)
         subprocess.run([str(java), "-cp", output, package + ".HomeWidgetResizeTest"], check=True)
+        subprocess.run([str(java), "-cp", output, package + ".FolderFanTest"], check=True)
 
 
 if __name__ == "__main__":

@@ -16,3 +16,4 @@ dist/
 *.pftrace
 .env
 .env.*
+.claude-captures/

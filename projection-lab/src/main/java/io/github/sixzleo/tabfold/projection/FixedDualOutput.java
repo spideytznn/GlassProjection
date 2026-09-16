@@ -17,6 +17,7 @@ final class FixedDualOutput implements TextureView.SurfaceTextureListener,AutoCl
     private final FrameLayout root;
     private final TextureView texture;
     private final View black;
+    private final View forwarder;
     private final FixedDualSession owner;
     private Surface surface;
     private boolean closed,blocked=true;
@@ -29,7 +30,8 @@ final class FixedDualOutput implements TextureView.SurfaceTextureListener,AutoCl
         width=turn%2==0?size.x:size.y;height=turn%2==0?size.y:size.x;
         android.util.DisplayMetrics metrics=new android.util.DisplayMetrics();display.getRealMetrics(metrics);density=metrics.densityDpi;
         Context context=service.createDisplayContext(display).createWindowContext(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,null);
-        manager=context.getSystemService(WindowManager.class);root=new FrameLayout(context);root.setBackgroundColor(Color.BLACK);
+        manager=context.getSystemService(WindowManager.class);
+        root=new FrameLayout(context);root.setBackgroundColor(Color.BLACK);
         texture=new TextureView(context);texture.setOpaque(true);texture.setSurfaceTextureListener(this);
         root.addView(texture,new FrameLayout.LayoutParams(width,height));
         texture.setPivotX(0);texture.setPivotY(0);
@@ -53,9 +55,28 @@ final class FixedDualOutput implements TextureView.SurfaceTextureListener,AutoCl
             }finally{event.recycle();}
         });
         WindowManager.LayoutParams p=new WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN|WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.OPAQUE);
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                |WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN|WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.OPAQUE);
         p.gravity=Gravity.TOP|Gravity.LEFT;p.setFitInsetsTypes(0);p.layoutInDisplayCutoutMode=WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
         p.setTitle("Duo "+(inner?"inner":"cover")+" independent output");manager.addView(root,p);
+        forwarder=new View(context);forwarder.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+        forwarder.setOnTouchListener((v,physicalEvent)->{
+            MotionEvent event=MotionEvent.obtain(physicalEvent);event.transform(inverse);
+            try{
+            if(blocked||contentId<0)return true;
+            if(event.getActionMasked()==MotionEvent.ACTION_DOWN)owner.touched(contentId);
+            if(feedback.touch(event,DuoHomeActivity.barePanel(contentId)))return true;
+            MobileHelper.dualTouch(contentId,event);return true;
+            }finally{event.recycle();}
+        });
+        // Full-screen forwarder: the home-drawn status bar owns top-edge pulls on
+        // the content display; the system shade is dormant in fixed dual.
+        WindowManager.LayoutParams f=new WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                |WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,PixelFormat.TRANSPARENT);
+        f.gravity=Gravity.TOP|Gravity.LEFT;f.setFitInsetsTypes(0);
+        f.layoutInDisplayCutoutMode=WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        f.setTitle("Duo "+(inner?"inner":"cover")+" touch forward");manager.addView(forwarder,f);
     }
     void frame(float angle,boolean block){
         if(closed)return;
@@ -72,5 +93,7 @@ final class FixedDualOutput implements TextureView.SurfaceTextureListener,AutoCl
     @Override public void onSurfaceTextureSizeChanged(SurfaceTexture s,int w,int h){}
     @Override public boolean onSurfaceTextureDestroyed(SurfaceTexture s){if(!closed)owner.fail("输出画面已断开");return true;}
     @Override public void onSurfaceTextureUpdated(SurfaceTexture s){}
-    @Override public void close(){if(closed)return;closed=true;if(gpu!=null)gpu.close();try{manager.removeViewImmediate(root);}catch(IllegalArgumentException ignored){}if(surface!=null)surface.release();}
+    @Override public void close(){if(closed)return;closed=true;if(gpu!=null)gpu.close();
+        try{manager.removeViewImmediate(forwarder);}catch(IllegalArgumentException ignored){}
+        try{manager.removeViewImmediate(root);}catch(IllegalArgumentException ignored){}if(surface!=null)surface.release();}
 }
