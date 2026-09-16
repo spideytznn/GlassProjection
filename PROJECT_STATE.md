@@ -32,6 +32,18 @@
 - **svc 通道接入无线调试直连后端**（减少 Shizuku 依赖）：IHelperHost 是统一接口，Shizuku/无线直连二选一都走它——把 svc/gesture 依赖标注到直连后端可用。
 - 桌面预览入口下移 + 时钟/天气等价替代（原计划遗留）。
 
+## 文件夹/大文件夹调研结论（2026-09-17 凌晨，明日实施）
+
+- **澎湃OS 产品形态**（调研：MIUI14 引入大文件夹；HyperOS4 支持拖拽调尺寸）：三档尺寸 **1x1（传统小文件夹）/ 2x2（四宫格）/ 4x2（横条）**；2x2 内直接显示 3x3 应用缩略、**点击缩略直接启动应用**、点标题/空白展开全量面板；长按弹出尺寸切换。澎湃取消 4x7 就是为了 2x2/4x2 的网格对齐数学（我们 4x5 已天然对齐）。
+- **Launcher3 实现范式**（googlesource Launcher3 folder/ 包）：FolderIcon（折叠态：PreviewBackground 圆底 + ClippedFolderIconLayoutRule 排预览图标，最多 N 个）/ Folder（展开视图 FolderGridOrganizer 排网格）/ FolderAnimationManager（开合 AnimatorSet 图标飞行）。参考文章有九宫格预览改造和透明背景改造的现成路径。
+- **我们的落地方案**：
+  1. 数据：HomeLayout.Item 已有 spanX/spanY（widget 在用）——文件夹直接复用做尺寸（1x1/2x2/4x2），cells() 装箱已支持任意 w/h，改动极小；store JSON 已序列化 span 字段 ✓ 向后兼容。
+  2. 渲染：FolderFan 升级三档——1x1 现状扇形；2x2 九宫格（3x3 缩略=格宽/3，每个缩略 onClick 直接 launch，标题条+右上展开角标）；4x2 横排 4x2 缩略+标题。
+  3. 展开：现有 HomeSheet folder() 面板保留；补 Launcher3 式开合动画（图标从缩略位飞到展开位）。
+  4. 交互：长按文件夹→尺寸菜单（三档切换改 span + save + render）；拖入 merge/拖出 extract 已有。
+  5. 迁移：scan 的 FOLDER 行已有 bounds（462px=2x2）——apply 时按 cell 单位换算 span 写入（当前当 1x1 处理，明日改）。
+  6. **三存储同步**（明日第一件事）：apply 同时写 duo_home/duo_inner/duo_cover（用户实测：主屏有文件夹、固定双屏没有——后两者仍是旧种子布局）。
+
 ## 4×5 网格（第二十三轮，已完成）
 
 - `HomeLayout`：`COLUMNS=4, ROWS=5, PAGE_SIZE=20` 常量化（cells()/span 夹全部改用常量）；`DuoHomeActivity.appPage` cols=常量、`fitAppRows` rows=ROWS；`HomeWidgets.gridGeometry`/`resizeChoices`；`HomeStore.read` span 夹常量。
