@@ -26,6 +26,12 @@
 4. 迁移收尾：MIUI 私有组件（时钟/天气）用独立 app 等价 provider 或自绘占位卡片替代（可选）。
 5. apply 广播当前被每个 DuoHomeActivity 实例各执行一次（幂等无害，待按 display 过滤）。
 
+## 明日首要（用户实测反馈 2026-09-17 凌晨）
+
+- **用户看到的桌面只是普通 4×5 空布局——迁移的文件夹和小组件没有出现在用户实际使用的桌面上！**（我验证的是 duo_home/display 0 的截图；嫌疑：用户看的是固定双屏虚拟屏的 duo_inner/duo_cover 独立 store——迁移只写了 duo_home；或最近重装把 duo_home 布局重置。明日先查三个 store 内容确认用户看的是哪份，然后把迁移结果同步/应用到用户实际桌面（或迁移时三 store 一起应用）。
+- **svc 通道接入无线调试直连后端**（减少 Shizuku 依赖）：IHelperHost 是统一接口，Shizuku/无线直连二选一都走它——把 svc/gesture 依赖标注到直连后端可用。
+- 桌面预览入口下移 + 时钟/天气等价替代（原计划遗留）。
+
 ## 4×5 网格（第二十三轮，已完成）
 
 - `HomeLayout`：`COLUMNS=4, ROWS=5, PAGE_SIZE=20` 常量化（cells()/span 夹全部改用常量）；`DuoHomeActivity.appPage` cols=常量、`fitAppRows` rows=ROWS；`HomeWidgets.gridGeometry`/`resizeChoices`；`HomeStore.read` span 夹常量。
