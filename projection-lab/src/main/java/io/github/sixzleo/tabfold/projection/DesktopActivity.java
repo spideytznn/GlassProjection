@@ -28,6 +28,8 @@ public final class DesktopActivity extends Activity {
             updateButton.setContentDescription(available?"检查更新，有新版本":"检查更新");}
     };
     private Button service;
+    private Button gestures;
+    private boolean switchingGestures;
     private Button blacklist;
     private SeekBar blur,stretch,open,close,holdTime,startAngle;
     private Switch swipeRestore;
@@ -60,6 +62,8 @@ public final class DesktopActivity extends Activity {
         page.addView(text("让每一次开合，柔和衔接。",14,MUTED));space(page,24);
         LinearLayout status=card(page);state=text("动画已就绪",17,ACCENT);state.setTypeface(null,Typeface.BOLD);status.addView(state);
         hint=text("在桌面或亮屏锁屏界面，展开或合拢手机即可体验。",13,MUTED);hint.setPadding(0,dp(7),0,dp(14));status.addView(hint);
+        section(page,"玻璃桌面 · 预览版","侧边 Dock、应用分页和手机现有小组件。可先预览，再选择是否设为默认桌面。");
+        button(card(page),"打开桌面预览",()->startActivity(new Intent(this,DuoHomeActivity.class)),true);
         section(page,"① 连接手机端助手","首次配对一次，之后自动寻找本机并连接。不用填写 IP 和端口。");
         LinearLayout mobile=card(page);mobileStatus=text("",13,MUTED);mobile.addView(mobileStatus);
         button(mobile,"配对",this::pairWireless,true);
@@ -72,6 +76,10 @@ public final class DesktopActivity extends Activity {
             if(!MobileHelper.ready()&&ProjectionService.instance==null){Toast.makeText(this,"请先完成第 1 步：连接手机端助手",Toast.LENGTH_SHORT).show();return;}
             AccessibilitySettings.open(this);
         },true);
+        section(page,"全面屏手势 · 兼容模式","从左右边缘内滑返回；从底部上滑回桌面，上滑并停留打开小米最近任务。启用时隐藏底部三键。");
+        LinearLayout navigation=card(page);
+        gestures=button(navigation,"启用全面屏手势",this::toggleGestures,true);
+        navigation.addView(text("手势由玻璃投影无障碍服务识别，主页、返回和最近任务仍交给系统执行。停用无障碍服务时会自动恢复三键导航。",12,MUTED));
         section(page,"后台运行","允许后台运行，退出设置页后也能继续使用。");
         LinearLayout background=card(page);
         button(background,"后台运行设置",()->startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,android.net.Uri.parse("package:"+getPackageName()))),false);
@@ -125,6 +133,12 @@ public final class DesktopActivity extends Activity {
         if(mobileStatus!=null)mobileStatus.setText(MobileHelper.message);
         service.setText(enabled?"管理无障碍服务":MobileHelper.ready()?"开启无障碍":"先连接助手，再开启无障碍");
         service.setAlpha(enabled||MobileHelper.ready()?1:.5f);
+        if(gestures!=null){boolean navigation=GestureNavigation.enabled(this);gestures.setText(switchingGestures?GestureNavigation.status:navigation?"恢复三键导航":"启用全面屏手势");gestures.setEnabled(!switchingGestures);gestures.setAlpha(!switchingGestures&&((navigation&&MobileHelper.ready())||(enabled&&MobileHelper.ready()))?1:.55f);}
+    }
+    private void toggleGestures(){
+        if(switchingGestures)return;
+        boolean next=!GestureNavigation.enabled(this);switchingGestures=true;refreshStatus();
+        GestureNavigation.request(this,next,message->{switchingGestures=false;refreshStatus();Toast.makeText(this,message,Toast.LENGTH_LONG).show();});
     }
     private void pairWireless(){
         if(MobileHelper.wirelessReady()){Toast.makeText(this,"已配对，无需重复配对",Toast.LENGTH_LONG).show();return;}

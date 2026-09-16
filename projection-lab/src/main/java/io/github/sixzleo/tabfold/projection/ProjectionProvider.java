@@ -9,6 +9,18 @@ public final class ProjectionProvider extends ContentProvider {
     @Override public Bundle call(String method,String arg,Bundle extras){
         if(Binder.getCallingUid()!=2000 && Binder.getCallingUid()!=android.os.Process.myUid())throw new SecurityException("Own app or ADB shell only");
         Bundle b=new Bundle();
+        if("fixed-dual-session".equals(method)){
+            if(arg!=null)new Handler(Looper.getMainLooper()).post(()->{if("0".equals(arg))FixedDualSession.stop();else if("1".equals(arg))FixedDualSession.start(ProjectionService.instance);});
+            b.putString("status",FixedDualSession.status);b.putString("innerRenderer",FixedDualGpu.innerStats);b.putString("coverRenderer",FixedDualGpu.coverStats);return b;
+        }
+        if("fixed-dual-test".equals(method)){
+            if(arg!=null){
+                final int seconds;
+                try{seconds=Integer.parseInt(arg);}catch(NumberFormatException e){b.putString("status","ERROR invalid duration");return b;}
+                new Handler(Looper.getMainLooper()).post(()->FixedDualTrial.start(ProjectionService.instance,seconds));
+            }
+            b.putString("status",FixedDualTrial.status);return b;
+        }
         if("helper-connect".equals(method)){
             if(Binder.getCallingUid()!=2000)throw new SecurityException("Shell host only");
             MobileHelper.init(getContext());

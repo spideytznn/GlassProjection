@@ -1,0 +1,34 @@
+<resources>
+    <style name="DuoHomeTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowShowWallpaper">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:colorAccent">#BCEFE3</item>
+        <item name="android:alertDialogTheme">@style/HomeDialogTheme</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+    <style name="HomeSheetTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:backgroundDimEnabled">true</item>
+        <item name="android:backgroundDimAmount">0.25</item>
+        <item name="android:windowAnimationStyle">@style/HomePanelAnimation</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:colorAccent">#BCEFE3</item>
+    </style>
+    <style name="HomePanelAnimation">
+        <item name="android:windowEnterAnimation">@anim/home_panel_enter</item>
+        <item name="android:windowExitAnimation">@anim/home_panel_exit</item>
+    </style>
+    <style name="HomeDialogTheme" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:windowBackground">@drawable/home_dialog_surface</item>
+        <item name="android:windowAnimationStyle">@style/HomePanelAnimation</item>
+        <item name="android:backgroundDimAmount">0.25</item>
+        <item name="android:colorAccent">#BCEFE3</item>
+        <item name="android:textColorPrimary">#F4F7FB</item>
+        <item name="android:textColorSecondary">#C3CEDB</item>
+    </style>
+</resources>

@@ -44,7 +44,11 @@ final class UpdateCoordinator {
     File apk(){return new File(folder(),"verified.apk");}
     File partial(){return new File(folder(),"verified.apk.partial");}
     String version(){return currentVersion;}
-    boolean isNewer(ApkRelease release){return release!=null&&UpdateTrust.compareVersion(release.tag,version())>0;}
+    boolean isNewer(ApkRelease release){
+        if(release==null)return false;
+        try{return UpdateTrust.compareVersion(release.tag,version())>0;}
+        catch(IllegalArgumentException invalidVersion){return false;} // An unknown build label must not crash an activity or offer an unverified downgrade.
+    }
     boolean hasUpdate(){return isNewer(latest)||isNewer(job);}
     ApkRelease offered(){return isNewer(job)&&((downloading||ready||received>0)||!isNewer(latest))?job:latest;}
     String releasePage(){ApkRelease r=offered();return r==null?UpdateTrust.RELEASES:r.page;}

@@ -56,13 +56,41 @@ final class MobileHelper {
         worker.execute(()->{boolean okay=false;try{if(active&&current!=null)okay=current.observeTouch(connection,true);}catch(Exception ignored){}
             final boolean result=okay;main.post(()->done.accept(result));});
     }
+    static void configureGestureNavigation(boolean enabled,java.util.function.Consumer<String> done){
+        final IHelperHost current=host;
+        worker.execute(()->{
+            String result="ERROR 手机端助手未连接";
+            try{if(current!=null&&current.asBinder().isBinderAlive())result=current.configureGestureNavigation(enabled);}
+            catch(Exception e){result="ERROR "+e.getMessage();}
+            final String value=result;main.post(()->done.accept(value));
+        });
+    }
+    private static final IBinder fixedLifetime=new Binder();
+    static void fixedDualState(int state,java.util.function.Consumer<String> done){
+        final IHelperHost current=host;
+        worker.execute(()->{String value;try{value=current==null?"ERROR helper unavailable":current.fixedDualState(state,fixedLifetime);}catch(Exception e){value="ERROR "+e;}
+            final String result=value;main.post(()->done.accept(result));});
+    }
+    static void dualContact(java.util.function.Consumer<Bundle> done){IHelperHost current=host;
+        worker.execute(()->{Bundle result=null;try{if(current!=null)result=current.dualContact();}catch(Exception ignored){}
+            Bundle value=result;main.post(()->done.accept(value));});}
+    static void createDualContent(android.view.Surface surface,int w,int h,int density,boolean inner,java.util.function.IntConsumer done){
+        IHelperHost current=host;
+        worker.execute(()->{int id=-1;try{if(current!=null)id=current.createDualContent(surface,w,h,density,inner);}catch(Exception e){android.util.Log.e("DuoFixed","Create",e);}
+            final int result=id;main.post(()->done.accept(result));});
+    }
+    static void dualTouch(int id,android.view.MotionEvent event){
+        IHelperHost current=host;android.view.MotionEvent copy=android.view.MotionEvent.obtain(event);
+        worker.execute(()->{try{if(current!=null)current.dualTouch(id,copy);}catch(Exception ignored){}finally{copy.recycle();}});
+    }
+    static void dualKey(int id,int key){IHelperHost current=host;worker.execute(()->{try{if(current!=null)current.dualKey(id,key);}catch(Exception ignored){}});}
     private static void schedule(){main.removeCallbacks(tick);main.post(tick);}
     private static final Runnable tick=new Runnable(){public void run(){
         if(!active&&!prepared)return;
         try{
             if(ready()){
                 final IHelperHost current=host;
-                if(active)worker.execute(()->{if(!active||current!=host)return;try{int state=current.ensureRunning();message=state==3?"手机端助手运行中":"助手启动未完成";}catch(Exception e){if(current==host)host=null;binding=false;message="连接中断，正在重连";}});
+                if(active)worker.execute(()->{if(!active||current!=host)return;try{int state=current.ensureRunning();message=state==4?"Duo 固定双屏运行中":state==3?"手机端助手运行中":"助手启动未完成";}catch(Exception e){if(current==host)host=null;binding=false;message="连接中断，正在重连";}});
                 else message="助手已连接，下一步开启无障碍";
             }
             else if(prefersWireless()){WirelessAdb.reconnect(context);}

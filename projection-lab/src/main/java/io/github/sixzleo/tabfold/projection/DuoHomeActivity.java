@@ -1,0 +1,665 @@
+package io.github.sixzleo.tabfold.projection;
+
+import android.app.*;
+import android.app.role.RoleManager;
+import android.appwidget.*;
+import android.content.*;
+import android.content.pm.LauncherApps;
+import android.content.res.Configuration;
+import android.graphics.*;
+import android.graphics.drawable.GradientDrawable;
+import android.os.*;
+import android.provider.Settings;
+import android.text.*;
+import android.view.*;
+import android.view.animation.PathInterpolator;
+import android.widget.*;
+import androidx.viewpager.widget.PagerAdapter;
+import androidx.viewpager.widget.ViewPager;
+import java.util.*;
+import java.util.concurrent.*;
+
+/** Optional native HOME. Task switching, split-screen and freeform remain system-owned. */
+public class DuoHomeActivity extends Activity {
+    private static final int TEXT=HomeStyle.TEXT,MUTED=HomeStyle.MUTED,ACCENT=HomeStyle.ACCENT;
+    static volatile boolean foreground;
+    private static final Map<Integer,DuoHomeActivity> panelActivities=new HashMap<>();
+    static boolean barePanel(int displayId){DuoHomeActivity a=panelActivities.get(displayId);if(a==null||!a.resumed||!a.hasWindowFocus()||a.editing||a.showWidgets||a.dialogs.stream().anyMatch(Dialog::isShowing))return false;WindowInsets insets=a.getWindow().getDecorView().getRootWindowInsets();return insets==null||!insets.isVisible(WindowInsets.Type.ime());}
+
+    private boolean resumed;
+    private boolean touching;
+    private List<HomeApps.App> pendingCatalog;
+    private final Runnable deliverCatalog=this::applyPendingCatalog;
+    private static volatile long entranceRequestedAt;
+    private static volatile boolean returningFromRecents;
+    private boolean entrancePending,windowEntranceComplete,entranceRunning,wasAway;
+    private long panelEntranceRequestedAt;
+    private final Runnable entranceFallback=()->{windowEntranceComplete=true;playPendingEntrance();};
+    private final ExecutorService loader=Executors.newSingleThreadExecutor();
+    private final Handler main=new Handler(Looper.getMainLooper());
+    private final Map<String,HomeApps.App> apps=new LinkedHashMap<>();
+    private HomeStore store;
+    private HomeLayout layout;
+    private HomeWidgets widgets;
+    private boolean editing,showWidgets,loaded,loading,reloadPending,wide;
+    private LinearLayout root;
+    private HomePager pager;
+    private ScrollView widgetScroll;
+    private int widgetScrollY;
+    private TextView loadLabel;
+    private final List<Dialog> dialogs=new ArrayList<>();
+    private final List<Runnable> catalogObservers=new ArrayList<>();
+    private final LauncherApps.Callback appChanges=new LauncherApps.Callback(){
+        public void onPackageRemoved(String p,UserHandle u){reload();}
+        public void onPackageAdded(String p,UserHandle u){reload();}
+        public void onPackageChanged(String p,UserHandle u){reload();}
+        public void onPackagesAvailable(String[] p,UserHandle u,boolean replacing){reload();}
+        public void onPackagesUnavailable(String[] p,UserHandle u,boolean replacing){reload();}
+    };
+    boolean dualPanel(){return this instanceof DuoInnerActivity||this instanceof DuoCoverActivity;}
+    String panelStore(){return this instanceof DuoInnerActivity?"duo_inner":this instanceof DuoCoverActivity?"duo_cover":"duo_home";}
+    int widgetHostId(){return this instanceof DuoInnerActivity?2702:this instanceof DuoCoverActivity?2703:2701;}
+    private int dp(float value){return Math.round(value*getResources().getDisplayMetrics().density);}
+    private int widgetDp(int pixels){return Math.round(pixels/getResources().getDisplayMetrics().density);}
+    @Override public void onCreate(Bundle saved){
+        super.onCreate(saved);if(dualPanel())panelActivities.put(getDisplay().getDisplayId(),this);store=new HomeStore(this,panelStore());layout=store.read();
+        if(saved!=null){showWidgets=saved.getBoolean("widgets");editing=saved.getBoolean("editing");widgetScrollY=saved.getInt("scroll");}
+        widgets=new HomeWidgets(this,store,()->{if(!isDestroyed()){
+            layout=store.read();
+            layout.items.removeIf(item->item.widget()&&!widgets.ids.contains(item.widgetId));layout.clamp();save();render();
+        }});
+        layout=store.read(); // Hosting startup removes IDs no longer allocated by the system.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
+        getWindow().setStatusBarColor(Color.TRANSPARENT);getWindow().setNavigationBarColor(Color.TRANSPARENT);
+        getWindow().setDecorFitsSystemWindows(false);
+        getWindow().getDecorView(); // HyperOS does not create DecorView in getInsetsController().
+        WindowInsetsController bars=getWindow().getInsetsController();
+        if(bars!=null)bars.setSystemBarsAppearance(0,WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS|WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
+        getSystemService(LauncherApps.class).registerCallback(appChanges,main);
+        render();reload();
+    }
+    @Override protected void onStart(){super.onStart();widgets.start();}
+    @Override protected void onResume(){super.onResume();if(wasAway){if(dualPanel())panelEntranceRequestedAt=SystemClock.uptimeMillis();else requestHomeEntrance();wasAway=false;}resumed=true;foreground=hasWindowFocus();ProjectionService.refreshHomeScope();animateEntranceIfRequested();}
+    @Override protected void onPause(){entrancePending=false;entranceRunning=false;if(root!=null){root.animate().cancel();root.setAlpha(1f);root.setScaleX(1f);root.setScaleY(1f);root.setTranslationY(0); }wasAway=true;touching=false;resumed=false;foreground=false;windowEntranceComplete=false;main.removeCallbacks(entranceFallback);ProjectionService.refreshHomeScope();save();super.onPause();}
+    @Override public boolean dispatchTouchEvent(MotionEvent event){
+        int action=event.getActionMasked();if(action==MotionEvent.ACTION_DOWN)touching=true;
+        try{return super.dispatchTouchEvent(event);}
+        finally{if(action==MotionEvent.ACTION_UP||action==MotionEvent.ACTION_CANCEL)touching=false;}
+    }
+    @Override protected void onStop(){widgets.stop();super.onStop();}
+    @Override protected void onDestroy(){
+        if(dualPanel())panelActivities.remove(getDisplay().getDisplayId(),this);
+        widgets.close();
+        getSystemService(LauncherApps.class).unregisterCallback(appChanges);loader.shutdownNow();main.removeCallbacksAndMessages(null);
+        for(Dialog d:dialogs)if(d.isShowing())d.dismiss();dialogs.clear();super.onDestroy();
+    }
+    @Override public void onConfigurationChanged(Configuration config){super.onConfigurationChanged(config);render();}
+    @Override protected void onNewIntent(Intent intent){super.onNewIntent(intent);setIntent(intent);if(!dualPanel()&&FixedDualSession.active())FixedDualSession.nativeHomeRequested();
+        for(Dialog d:dialogs)if(d.isShowing())d.dismiss();
+        widgets.dismissPicker();
+        boolean changed=editing||showWidgets;editing=false;showWidgets=false;if(changed)render();animateEntranceIfRequested();}
+    @Override protected void onSaveInstanceState(Bundle state){save();state.putBoolean("widgets",showWidgets);state.putBoolean("editing",editing);
+        state.putInt("scroll",widgetScroll==null?widgetScrollY:widgetScroll.getScrollY());super.onSaveInstanceState(state);}
+    @Override public void onBackPressed(){
+        if(editing||showWidgets){editing=false;showWidgets=false;render();}
+        else if(!isDefaultHome())finish();
+    }
+    @Override protected void onActivityResult(int request,int result,Intent data){
+        super.onActivityResult(request,result,data);if(widgets.result(request,result,data))return;
+        if(request==4201){ProjectionService.refreshHomeScope();render();}
+    }
+    private void reload(){
+        if(isDestroyed()||loader.isShutdown())return;
+        if(loading){reloadPending=true;return;}loading=true;
+        loader.execute(()->{
+            try{
+                List<HomeApps.App> found=HomeApps.load(getApplicationContext());
+                main.post(()->queueCatalog(found));
+            }catch(RuntimeException e){main.post(()->{if(isDestroyed())return;loading=false;notifyCatalog();message("应用列表暂时无法加载，可在菜单中刷新");});}
+        });
+    }
+    private void queueCatalog(List<HomeApps.App> found){
+        if(isDestroyed())return;
+        pendingCatalog=found;main.removeCallbacks(deliverCatalog);applyPendingCatalog();
+    }
+    private void applyPendingCatalog(){
+        if(isDestroyed()||pendingCatalog==null)return;
+        // Keep the page and native widget views alive for the complete touch/settle sequence.
+        if(resumed&&(entrancePending||entranceRunning||panelChanging||touching||(pager!=null&&pager.isInteracting()))){main.postDelayed(deliverCatalog,80);return;}
+        List<HomeApps.App> found=pendingCatalog;pendingCatalog=null;
+        apps.clear();for(HomeApps.App app:found)apps.put(app.key,app);
+        layout.discover(apps.keySet());if(!store.dockSeeded()){if(layout.dock.isEmpty())seedDock();if(!layout.dock.isEmpty())store.markDockSeeded();}
+        loaded=true;loading=false;save();render();notifyCatalog();if(reloadPending){reloadPending=false;reload();}
+    }
+    private void notifyCatalog(){for(Runnable observer:new ArrayList<>(catalogObservers))observer.run();}
+    private void save(){if(store!=null&&layout!=null)store.save(layout);}
+    static void requestHomeEntrance(){entranceRequestedAt=SystemClock.uptimeMillis();}
+    static void observeRecents(){returningFromRecents=true;}
+    static void leaveRecentsForApplication(){returningFromRecents=false;}
+    @Override public void onWindowFocusChanged(boolean focused){super.onWindowFocusChanged(focused);foreground=resumed&&focused;ProjectionService.refreshHomeScope();if(foreground)animateEntranceIfRequested();}
+    private void animateEntranceIfRequested(){
+        // A real secondary HOME already participates in WindowManager's home
+        // transition. Hiding its tree until that transition ends leaves a blank
+        // wallpaper interval, then plays an unnecessary second entrance.
+        if(this instanceof DuoSecondaryActivity){panelEntranceRequestedAt=0;return;}
+        if(!hasWindowFocus())return;
+        if(entrancePending){playPendingEntrance();return;}
+        long requested=dualPanel()?panelEntranceRequestedAt:entranceRequestedAt;
+        if((dualPanel()||!returningFromRecents)&&(requested==0||SystemClock.uptimeMillis()-requested>1200))return;
+        if(dualPanel())panelEntranceRequestedAt=0;
+        else{ returningFromRecents=false;entranceRequestedAt=0; }
+        if(!android.animation.ValueAnimator.areAnimatorsEnabled())return;
+        entrancePending=true;
+        root.animate().cancel();root.setAlpha(0f);root.setScaleX(.965f);root.setScaleY(.965f);root.setTranslationY(dp(18));
+        android.util.Log.i("DuoEntrance","armed; systemComplete="+windowEntranceComplete);
+        if(windowEntranceComplete)playPendingEntrance();
+        else {main.removeCallbacks(entranceFallback);main.postDelayed(entranceFallback,700);}
+    }
+    @Override public void onEnterAnimationComplete(){
+        super.onEnterAnimationComplete();windowEntranceComplete=true;
+        android.util.Log.i("DuoEntrance","system transition complete");
+        playPendingEntrance();
+    }
+    private void playPendingEntrance(){
+        if(!entrancePending||!resumed||!hasWindowFocus()||!windowEntranceComplete||root==null)return;
+        entrancePending=false;entranceRunning=true;main.removeCallbacks(entranceFallback);
+        // Wait for the system's app transition, then animate the current tree rather
+        // than a tree that a late catalog update may detach during the transition.
+        root.postOnAnimation(()->{
+            if(!resumed||!hasWindowFocus()||isDestroyed()){entranceRunning=false;return;}
+            LinearLayout target=root;
+            android.util.Log.i("DuoEntrance","visible entrance start");
+            target.animate().cancel();target.setAlpha(0f);target.setScaleX(.965f);target.setScaleY(.965f);target.setTranslationY(dp(18));
+            target.animate().alpha(1f).scaleX(1f).scaleY(1f).translationY(0).setDuration(260)
+                .setInterpolator(new PathInterpolator(.2f,0f,0f,1f)).withEndAction(()->entranceRunning=false).start();
+        });
+    }
+    private void seedDock(){
+        Intent[] intents={new Intent(Intent.ACTION_DIAL),new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_BROWSER),
+            new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_MESSAGING),new Intent(android.provider.MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)};
+        String[][] fallback={{"com.android.contacts","com.google.android.dialer"},{"com.android.browser","com.mi.globalbrowser","com.android.chrome"},
+            {"com.android.mms","com.google.android.apps.messaging"},{"com.android.camera","com.google.android.GoogleCamera"}};
+        for(int i=0;i<intents.length;i++){
+            List<String> packages=new ArrayList<>();android.content.pm.ResolveInfo resolved=getPackageManager().resolveActivity(intents[i],0);
+            if(resolved!=null&&resolved.activityInfo!=null)packages.add(resolved.activityInfo.packageName);packages.addAll(Arrays.asList(fallback[i]));
+            boolean found=false;for(String pkg:packages){for(HomeApps.App app:apps.values())if(app.user.equals(android.os.Process.myUserHandle())&&app.component.getPackageName().equals(pkg)){
+                layout.pin(app.key);found=true;break;}if(found)break;}
+        }
+    }
+    private void render(){
+        if(isDestroyed())return;
+        panelChanging=false;
+        pager=null; // Detached pagers must not write a stale selection during a rebuild.
+        if(widgetScroll!=null)widgetScrollY=widgetScroll.getScrollY();widgetScroll=null;
+        Rect bounds=getWindowManager().getCurrentWindowMetrics().getBounds();
+        float density=getResources().getDisplayMetrics().density;
+        wide=bounds.width()/density>=600;
+        root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setTag("home-root");
+        root.setBackgroundColor(Color.TRANSPARENT);
+        setContentView(root);
+        root.setOnApplyWindowInsetsListener((v,insets)->{
+            Insets bars=insets.getInsets(WindowInsets.Type.systemBars()|WindowInsets.Type.displayCutout());
+            v.setPadding(bars.left+dp(wide?24:12),bars.top+dp(8),bars.right+dp(wide?24:12),bars.bottom+dp(12));return insets;
+        });
+        LinearLayout header=row();header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setTag("home-header");
+        if(!wide)header.addView(panelSwitch(showWidgets),new LinearLayout.LayoutParams(dp(142),dp(44)));
+        header.addView(new View(this),new LinearLayout.LayoutParams(0,dp(48),1));
+        if(!isDefaultHome()){TextView mode=text("桌面预览",12,TEXT);mode.setPadding(dp(12),0,dp(12),0);mode.setShadowLayer(dp(2),0,dp(1),0x88000000);header.addView(mode);}
+        LinearLayout actions=row();actions.setGravity(Gravity.CENTER_VERTICAL);actions.setTag("home-actions");
+        actions.addView(actionIcon(editing?"完成":"编辑",()->{editing=!editing;render();}),new LinearLayout.LayoutParams(dp(44),dp(44)));
+        LinearLayout.LayoutParams settingsSize=new LinearLayout.LayoutParams(dp(44),dp(44));settingsSize.leftMargin=dp(8);
+        actions.addView(actionIcon("设置",this::menu),settingsSize);
+        header.addView(actions,new LinearLayout.LayoutParams(-2,dp(48)));
+        root.addView(header);
+        // All three columns share one inset content rectangle. MATCH_PARENT plus top
+        // margins could make weighted columns extend below the body's clipping edge.
+        LinearLayout body=row();body.setTag("home-body");body.setBaselineAligned(false);body.setGravity(Gravity.TOP);
+        body.setPadding(0,dp(8),0,dp(8));root.addView(body,new LinearLayout.LayoutParams(-1,0,1));
+        if(wide){View panel=widgetPanel();LinearLayout.LayoutParams wp=new LinearLayout.LayoutParams(0,-1,.95f);wp.setMargins(0,0,dp(18),0);body.addView(panel,wp);}
+        View workspace=!wide&&showWidgets?widgetPanel():workspace();
+        body.addView(workspace,new LinearLayout.LayoutParams(0,-1,1.1f));
+        LinearLayout.LayoutParams dockSize=new LinearLayout.LayoutParams(dp(68),-1);dockSize.setMargins(dp(wide?16:8),0,0,0);
+        body.addView(dockColumn(),dockSize);
+        root.requestApplyInsets();
+    }
+    private View workspace(){
+        LinearLayout panel=column();panel.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout title=row();title.setGravity(Gravity.CENTER_VERTICAL);
+        if(editing){TextView label=text("长按拖动 · 中心合并为文件夹",15,MUTED);title.addView(label,new LinearLayout.LayoutParams(0,dp(32),1));}
+        if(editing)title.addView(button("＋组件",()->{save();widgets.choose(layout.page);}),new LinearLayout.LayoutParams(dp(80),dp(44)));
+        if(editing)panel.addView(title);
+        HomePager pagesView=new HomePager(this);pager=pagesView;pagesView.setTag("home-pager");
+        pagesView.setSaveFromParentEnabled(false);pagesView.setOffscreenPageLimit(1);
+        pagesView.setPageMargin(dp(12));
+        pagesView.setAdapter(new PagerAdapter(){
+            @Override public int getCount(){return layout.pages();}
+            @Override public boolean isViewFromObject(View view,Object item){return view==item;}
+            @Override public Object instantiateItem(ViewGroup container,int position){
+                View page=appPage(position);container.addView(page);return page;
+            }
+            @Override public void destroyItem(ViewGroup container,int position,Object item){container.removeView((View)item);}
+        });
+        pagesView.setCurrentItem(layout.page,false);panel.addView(pagesView,new LinearLayout.LayoutParams(-1,0,1));
+        LinearLayout pages=row();pages.setGravity(Gravity.CENTER_VERTICAL);
+        Button previous=button("‹",()->turn(-1));previous.setContentDescription("上一页");previous.setEnabled(layout.page>0);
+        Button next=button("›",()->turn(1));next.setContentDescription("下一页");next.setEnabled(layout.page<layout.pages()-1);
+        pageDrop(previous,-1);pageDrop(next,1);
+        pages.addView(previous,new LinearLayout.LayoutParams(dp(44),dp(48)));
+        TextView counter=text(pageDots(layout.page,layout.pages()),13,MUTED);counter.setTag("home-page-counter");counter.setGravity(Gravity.CENTER);
+        counter.setContentDescription("第 "+(layout.page+1)+" 页，共 "+layout.pages()+" 页，点击跳转");counter.setFocusable(true);
+        counter.setOnClickListener(v->choosePage());pages.addView(counter,new LinearLayout.LayoutParams(0,dp(48),1));
+        pages.addView(next,new LinearLayout.LayoutParams(dp(44),dp(48)));panel.addView(pages);
+        pagesView.addOnPageChangeListener(new ViewPager.SimpleOnPageChangeListener(){
+            @Override public void onPageSelected(int position){
+                if(pager!=pagesView)return;
+                layout.page=position;save();
+                counter.setText(pageDots(position,layout.pages()));
+                counter.setContentDescription("第 "+(position+1)+" 页，共 "+layout.pages()+" 页，点击跳转");
+                previous.setEnabled(position>0);next.setEnabled(position<layout.pages()-1);
+            }
+        });
+        return panel;
+    }
+    private String pageDots(int page,int count){
+        int shown=Math.min(7,count),first=Math.max(0,Math.min(page-shown/2,count-shown));StringBuilder dots=new StringBuilder();
+        for(int i=0;i<shown;i++){if(i>0)dots.append("  ");dots.append(first+i==page?'●':'○');}return dots.toString();
+    }
+    private View appPage(int page){
+        FrameLayout frame=new FrameLayout(this);
+        FrameLayout scroll=new FrameLayout(this);scroll.setClipToPadding(false);frame.addView(scroll,new FrameLayout.LayoutParams(-1,-1));
+        GridLayout grid=new GridLayout(this);grid.setTag("home-app-grid");int cols=4;
+        grid.setColumnCount(cols);grid.setAlignmentMode(GridLayout.ALIGN_BOUNDS);scroll.addView(grid,new FrameLayout.LayoutParams(-1,-2));
+        scroll.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->fitAppRows(scroll,grid,cols));
+        int count=0;
+        for(HomeLayout.Cell cell:layout.cells()){
+            if(!loaded||cell.page!=page)continue;count++;
+            HomeLayout.Item item=cell.item;int index=layout.items.indexOf(item);
+            View tile=item.widget()?workspaceWidget(item):tile(item);
+            tile.setOnDragListener((v,event)->{
+                if(!(event.getLocalState() instanceof String))return false;
+                String source=(String)event.getLocalState();
+                switch(event.getAction()){
+                    case DragEvent.ACTION_DRAG_STARTED:return !source.equals(item.id);
+                    case DragEvent.ACTION_DRAG_ENTERED:v.setBackground(glass(0x667fe1d0,20));return true;
+                    case DragEvent.ACTION_DRAG_EXITED:case DragEvent.ACTION_DRAG_ENDED:v.setBackground(null);return true;
+                    case DragEvent.ACTION_DROP:
+                        if(!item.widget()&&layout.find(source)!=null&&!layout.find(source).widget()&&event.getX()>v.getWidth()*.28f&&event.getX()<v.getWidth()*.72f)layout.merge(source,item.id);
+                        else layout.move(source,index+(event.getX()>v.getWidth()*.5f?1:0));
+                        save();main.post(this::render);return true;
+                    default:return true;
+                }
+            });
+            tile.setTag(cell);
+            GridLayout.LayoutParams lp=new GridLayout.LayoutParams(GridLayout.spec(cell.y,cell.height),GridLayout.spec(cell.x,cell.width));
+            lp.width=dp(60)*cell.width;lp.height=dp(wide?96:92)*cell.height;lp.setMargins(dp(2),dp(2),dp(2),dp(2));grid.addView(tile,lp);
+        }
+        if(!loaded||count==0){loadLabel=text(loaded?"此页没有应用\n点击下方搜索添加":"正在加载应用…",16,MUTED);loadLabel.setGravity(Gravity.CENTER);frame.addView(loadLabel,new FrameLayout.LayoutParams(-1,-1));}
+        return frame;
+    }
+    private void fitAppRows(View viewport,GridLayout grid,int columns){
+        if(viewport.getHeight()<=0||grid.getChildCount()==0)return;
+        int rows=(HomeLayout.PAGE_SIZE+columns-1)/columns;
+        // The cell plus its two 2 dp margins must fit all four rows exactly.
+        int cell=Math.max(1,Math.min(dp(wide?96:92),viewport.getHeight()/rows-dp(4)));
+        for(int i=0;i<grid.getChildCount();i++){
+            View child=grid.getChildAt(i);HomeLayout.Cell placement=(HomeLayout.Cell)child.getTag();
+            GridLayout.LayoutParams size=(GridLayout.LayoutParams)child.getLayoutParams();
+            int height=(cell+dp(4))*placement.height-dp(4),width=viewport.getWidth()*placement.width/columns-dp(4);
+            if(size.height!=height||size.width!=width){size.height=height;size.width=Math.max(1,width);child.setLayoutParams(size);}
+        }
+    }
+    private void turn(int delta){if(pager!=null)goToPage(pager.getCurrentItem()+delta);}
+    private void goToPage(int page){if(pager!=null)HomePageMotion.select(pager,page,android.animation.ValueAnimator.areAnimatorsEnabled());}
+    private void choosePage(){String[] choices=new String[layout.pages()];for(int i=0;i<choices.length;i++)choices[i]="第 "+(i+1)+" 页";
+        show(new AlertDialog.Builder(this).setTitle("跳转页面").setItems(choices,(d,n)->goToPage(n)).create());}
+    private void pageDrop(View target,int direction){target.setOnDragListener((v,e)->{
+        if(!(e.getLocalState() instanceof String))return false;
+        if(e.getAction()==DragEvent.ACTION_DROP){int page=Math.max(0,Math.min(layout.pages(),layout.page+direction));
+            layout.move((String)e.getLocalState(),layout.pageStart(page)+(direction>0?1:0));layout.page=page;layout.clamp();save();main.post(this::render);}
+        return true;
+    });}
+    private View tile(HomeLayout.Item item){
+        LinearLayout tile=column();tile.setGravity(Gravity.CENTER);tile.setPadding(dp(3),dp(4),dp(3),dp(4));
+        if(item.folder()){
+            GridLayout folder=new GridLayout(this);folder.setColumnCount(2);folder.setPadding(dp(6),dp(6),dp(6),dp(6));folder.setBackground(glass(0x668ca3b9,17));
+            for(int i=0;i<Math.min(4,item.apps.size());i++){ImageView icon=icon(item.apps.get(i));GridLayout.LayoutParams p=new GridLayout.LayoutParams();p.width=dp(18);p.height=dp(18);p.setMargins(dp(1),dp(1),dp(1),dp(1));folder.addView(icon,p);}
+            tile.addView(folder,new LinearLayout.LayoutParams(dp(48),dp(48)));
+        }else tile.addView(icon(item.apps.get(0)),new LinearLayout.LayoutParams(dp(46),dp(46)));
+        TextView label=text(item.folder()?item.title:appLabel(item.apps.get(0)),11,TEXT);label.setGravity(Gravity.CENTER);label.setSingleLine(true);label.setEllipsize(TextUtils.TruncateAt.END);
+        label.setShadowLayer(dp(2),0,dp(1),0xb0000000);label.setPadding(0,dp(4),0,0);tile.addView(label,new LinearLayout.LayoutParams(-1,-2));
+        tile.setContentDescription(label.getText());tile.setFocusable(true);
+        tile.setOnClickListener(v->{if(editing)itemMenu(item);else if(item.folder())folder(item);else launch(item.apps.get(0),tile.getChildAt(0));});
+        tile.setOnLongClickListener(v->{v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            return v.startDragAndDrop(ClipData.newPlainText("桌面图标",item.id),new View.DragShadowBuilder(v),item.id,0);});
+        return tile;
+    }
+    private View dock(){
+        LinearLayout rail=column();rail.setTag("home-dock");rail.setPadding(dp(4),dp(12),dp(4),dp(12));rail.setGravity(Gravity.CENTER_HORIZONTAL);rail.setBackground(glass(0x55869bad,30));
+        HomeStyle.glass(rail,HomeStyle.PANEL_RADIUS);
+        LinearLayout icons=column();icons.setTag("home-dock-icons");icons.setGravity(Gravity.CENTER);rail.addView(icons,new LinearLayout.LayoutParams(-1,-1));
+        for(String key:layout.dock){ImageView icon=icon(key);LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(dp(48),dp(48));lp.setMargins(0,dp(6),0,dp(6));icons.addView(icon,lp);
+            icon.setContentDescription(appLabel(key));icon.setFocusable(true);icon.setOnClickListener(v->{if(editing)dockMenu(key);else launch(key,icon);});icon.setOnLongClickListener(v->{dockMenu(key);return true;});}
+        if(editing&&layout.dock.size()<HomeLayout.DOCK_SIZE){Button add=button("＋",()->pickApp("添加到 Dock",(app,source)->{if(layout.pin(app.key)){save();render();}}));add.setContentDescription("添加到侧边 Dock");icons.addView(add,new LinearLayout.LayoutParams(-1,dp(52)));}
+        rail.setOnDragListener((v,e)->{if(!(e.getLocalState() instanceof String))return false;
+            if(e.getAction()==DragEvent.ACTION_DROP){HomeLayout.Item item=layout.find((String)e.getLocalState());
+                if(item!=null&&!item.widget()&&!item.folder()){if(layout.pin(item.apps.get(0))){save();main.post(this::render);}else message("Dock 已满，请先移除一个图标");}
+                else message("请将单个应用添加到 Dock");}return true;});
+        return rail;
+    }
+    private View dockColumn(){
+        LinearLayout column=column();column.setGravity(Gravity.CENTER_HORIZONTAL);
+        LinearLayout.LayoutParams railSize=new LinearLayout.LayoutParams(-1,dp(264));railSize.topMargin=dp(wide?64:52);column.addView(dock(),railSize);
+        column.addView(new View(this),new LinearLayout.LayoutParams(1,0,1));
+        Button search=button("⌕",this::search);search.setContentDescription("搜索应用");search.setTextSize(22);HomeStyle.glass(search,24);
+        column.addView(search,new LinearLayout.LayoutParams(dp(48),dp(48)));return column;
+    }
+    private View widgetPanel(){
+        LinearLayout panel=column();panel.setTag("home-widgets");panel.setPadding(dp(12),dp(12),dp(12),dp(12));panel.setBackground(glass(0x28466077,28));
+        HomeStyle.glass(panel,HomeStyle.PANEL_RADIUS);
+        LinearLayout heading=row();
+        TextView title=text("今天",20,TEXT);heading.addView(title,new LinearLayout.LayoutParams(0,dp(46),1));
+        heading.addView(button("＋",widgets::choose),new LinearLayout.LayoutParams(dp(48),dp(46)));panel.addView(heading);
+        TextClock date=new TextClock(this);date.setFormat12Hour("M月d日 EEEE");date.setFormat24Hour("M月d日 EEEE");date.setTextColor(MUTED);date.setTextSize(13);panel.addView(date);
+        widgetScroll=new ScrollView(this);widgetScroll.setClipToPadding(false);widgetScroll.setPadding(0,dp(14),0,0);panel.addView(widgetScroll,new LinearLayout.LayoutParams(-1,0,1));
+        LinearLayout content=column();widgetScroll.addView(content,new ScrollView.LayoutParams(-1,-2));
+        if(widgets.ids.isEmpty()){
+            TextView empty=text("把常用的小组件放在这里",18,TEXT);empty.setPadding(dp(8),dp(28),dp(8),dp(12));content.addView(empty);
+            TextView hint=text("添加手机已有的天气、日历、音乐等组件，保留它们原有的内容与操作。",14,MUTED);hint.setPadding(dp(8),0,dp(8),dp(24));content.addView(hint);
+            content.addView(button("添加小组件",widgets::choose));
+        }
+        for(int id:new ArrayList<>(widgets.ids)){
+            boolean inWorkspace=false;for(HomeLayout.Item item:layout.items)if(item.widgetId==id)inWorkspace=true;if(inWorkspace)continue;
+            LinearLayout card=column();LinearLayout.LayoutParams cp=new LinearLayout.LayoutParams(-1,-2);cp.setMargins(0,0,0,dp(14));content.addView(card,cp);
+            AppWidgetProviderInfo info=widgets.manager.getAppWidgetInfo(id);
+            if(info==null){card.addView(text("组件暂不可用",14,MUTED));card.addView(button("移除",()->widgets.remove(id)));continue;}
+            if(editing){LinearLayout controls=row();TextView label=text(info.loadLabel(getPackageManager()),12,MUTED);controls.addView(label,new LinearLayout.LayoutParams(0,dp(44),1));
+                controls.addView(button("设置",()->widgetMenu(id)),new LinearLayout.LayoutParams(dp(60),dp(44)));card.addView(controls);}
+            try{
+                AppWidgetHostView view=widgets.view(id,info);if(view.getParent() instanceof ViewGroup)((ViewGroup)view.getParent()).removeView(view);
+                view.setPadding(0,0,0,0);
+                HomeStyle.rounded(view,HomeStyle.PANEL_RADIUS);
+                int minimum=widgetDp(info.minResizeHeight>0?info.minResizeHeight:info.minHeight);
+                int defaultHeight=Math.max(120,widgetDp(info.minHeight));int height=Math.max(minimum,store.widgetHeight(id)==0?defaultHeight:store.widgetHeight(id));
+                card.addView(view,new LinearLayout.LayoutParams(-1,dp(height)));
+                if(view.getTag()==null){view.setTag(Boolean.TRUE);view.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->{
+                    if(r-l>0&&(r-l!=or-ol||b-t!=ob-ot)){
+                        float scale=getResources().getDisplayMetrics().density;
+                        try{view.updateAppWidgetSize(new Bundle(),Collections.singletonList(new android.util.SizeF((r-l)/scale,(b-t)/scale)));}
+                        catch(RuntimeException failure){android.util.Log.w("GlassHome","Widget size update unavailable: "+id,failure);}
+                    }
+                });}
+            }catch(RuntimeException e){card.addView(text("这个小组件暂时无法显示",14,MUTED));card.addView(button("移除",()->widgets.remove(id)));}
+        }
+        ScrollView scroller=widgetScroll;scroller.post(()->scroller.scrollTo(0,widgetScrollY));return panel;
+    }
+    private View panelSwitch(boolean widgetsPage){
+        LinearLayout switcher=row();switcher.setGravity(Gravity.CENTER);switcher.setPadding(dp(3),dp(3),dp(3),dp(3));
+        switcher.setTag("home-panel-switch");
+        Button applications=button("应用",()->switchPanel(false));
+        Button widgetButton=button("小组件",()->switchPanel(true));
+        applications.setTextSize(13);widgetButton.setTextSize(13);
+        applications.setTextColor(widgetsPage?MUTED:TEXT);widgetButton.setTextColor(widgetsPage?TEXT:MUTED);
+        HomeStyle.glass(widgetsPage?widgetButton:applications,17,0x50343b43);
+        switcher.addView(applications,new LinearLayout.LayoutParams(0,-1,1));
+        switcher.addView(widgetButton,new LinearLayout.LayoutParams(0,-1,1));return switcher;
+    }
+    private View actionIcon(String label,Runnable action){
+        Button icon=new Button(this){
+            final Paint ink=new Paint(Paint.ANTI_ALIAS_FLAG);
+            @Override protected void onDraw(Canvas c){
+                super.onDraw(c);c.save();c.translate(getWidth()/2f-dp(12),getHeight()/2f-dp(12));c.scale(dp(24)/24f,dp(24)/24f);
+                ink.setColor(TEXT);ink.setStrokeWidth(1.7f);ink.setStyle(Paint.Style.STROKE);ink.setStrokeCap(Paint.Cap.ROUND);ink.setStrokeJoin(Paint.Join.ROUND);
+                if(label.equals("编辑")){Path p=new Path();p.moveTo(5,16);p.lineTo(16,5);p.lineTo(19,8);p.lineTo(8,19);p.lineTo(4,20);p.close();c.drawPath(p,ink);c.drawLine(13.5f,7.5f,16.5f,10.5f,ink);}
+                else if(label.equals("设置")){for(int i=0;i<3;i++){float y=6+i*6,x=i==1?15:9;c.drawLine(4,y,x-2,y,ink);c.drawLine(x+2,y,20,y,ink);c.drawCircle(x,y,2,ink);}}
+                else{Path p=new Path();p.moveTo(5,12);p.lineTo(10,17);p.lineTo(19,7);c.drawPath(p,ink);}c.restore();
+            }
+        };icon.setPadding(0,0,0,0);icon.setMinWidth(0);icon.setMinimumWidth(0);icon.setOnClickListener(v->action.run());icon.setContentDescription(label);icon.setTooltipText(label);
+        HomeStyle.glass(icon,22,0x50343b43);icon.setForeground(HomeStyle.ripple(icon,22));return icon;
+    }
+    private boolean panelChanging;
+    private void switchPanel(boolean target){
+        if(wide||showWidgets==target||panelChanging)return;
+        LinearLayout body=root.findViewWithTag("home-body"),owner=root;View outgoing=body.getChildAt(0);
+        panelChanging=true;
+        Runnable replace=()->{
+            if(root!=owner){panelChanging=false;return;}
+            if(widgetScroll!=null)widgetScrollY=widgetScroll.getScrollY();widgetScroll=null;pager=null;
+            showWidgets=target;
+            LinearLayout header=root.findViewWithTag("home-header");View previous=header.findViewWithTag("home-panel-switch");int at=header.indexOfChild(previous);header.removeView(previous);header.addView(panelSwitch(target),at,new LinearLayout.LayoutParams(dp(142),dp(44)));
+            body.removeView(outgoing);View incoming=target?widgetPanel():workspace();
+            body.addView(incoming,0,new LinearLayout.LayoutParams(0,-1,1.1f));
+            if(android.animation.ValueAnimator.areAnimatorsEnabled()){
+                incoming.setAlpha(0);incoming.setTranslationX(dp(target?16:-16));
+                incoming.animate().alpha(1).translationX(0).setDuration(220).setInterpolator(new PathInterpolator(.2f,0,0,1)).withEndAction(()->panelChanging=false).start();
+            }else panelChanging=false;
+        };
+        if(android.animation.ValueAnimator.areAnimatorsEnabled())outgoing.animate().alpha(0).translationX(dp(target?-10:10)).setDuration(110).withEndAction(replace).start();else replace.run();
+    }
+    private void widgetMenu(int id){
+        show(new AlertDialog.Builder(this).setTitle("小组件").setItems(new String[]{"组件设置","调整高度","上移","下移","移除","放到当前应用页"},(d,n)->{
+            if(n==0)widgets.reconfigure(id);
+            else if(n==1){AppWidgetProviderInfo info=widgets.manager.getAppWidgetInfo(id);if(info==null)return;
+                if((info.resizeMode&AppWidgetProviderInfo.RESIZE_VERTICAL)==0){message("这个组件不支持调整高度");return;}
+                int min=Math.max(1,widgetDp(info.minResizeHeight>0?Math.min(info.minHeight,info.minResizeHeight):info.minHeight));
+                int max=info.maxResizeHeight>=info.minHeight&&info.maxResizeHeight>0?Math.max(min,widgetDp(info.maxResizeHeight)):Math.max(min,600);
+                LinearLayout box=column();box.setPadding(dp(24),dp(16),dp(24),dp(16));TextView value=text("",16,TEXT);SeekBar seek=new SeekBar(this);
+                seek.setMax(max-min);seek.setProgress(Math.max(0,(store.widgetHeight(id)>0?store.widgetHeight(id):Math.max(120,widgetDp(info.minHeight)))-min));
+                value.setText((seek.getProgress()+min)+" dp");seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){public void onStartTrackingTouch(SeekBar b){}public void onStopTrackingTouch(SeekBar b){}public void onProgressChanged(SeekBar b,int p,boolean user){value.setText((p+min)+" dp");}});
+                box.addView(value);box.addView(seek);show(new AlertDialog.Builder(this).setTitle("组件高度").setView(box).setPositiveButton("保存",(a,b)->{store.widgetHeight(id,seek.getProgress()+min);render();}).setNegativeButton("取消",null).create());
+            }else if(n==2)widgets.move(id,-1);else if(n==3)widgets.move(id,1);
+            else if(n==5){AppWidgetProviderInfo info=widgets.manager.getAppWidgetInfo(id);if(info==null)return;int[] span=widgets.defaultSpan(info);
+                HomeLayout.Item item=layout.addWidget(id,layout.page,span[0],span[1]);layout.page=layout.pageOf(item.id);showWidgets=false;save();render();}
+            else widgets.remove(id);
+        }).create());
+    }
+    private View workspaceWidget(HomeLayout.Item item){
+        FrameLayout card=new FrameLayout(this);card.setContentDescription("桌面小组件");
+        HomeStyle.rounded(card,HomeStyle.PANEL_RADIUS);
+        AppWidgetProviderInfo info=widgets.manager.getAppWidgetInfo(item.widgetId);
+        if(info!=null)try{
+            AppWidgetHostView hosted=widgets.view(item.widgetId,info);
+            if(hosted.getParent() instanceof ViewGroup)((ViewGroup)hosted.getParent()).removeView(hosted);
+            hosted.setPadding(0,0,0,0);card.addView(hosted,new FrameLayout.LayoutParams(-1,-1));
+            card.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->{
+                if(r>l&&b>t&&(r-l!=or-ol||b-t!=ob-ot))try{
+                    float density=getResources().getDisplayMetrics().density;
+                    hosted.updateAppWidgetSize(new Bundle(),Collections.singletonList(new android.util.SizeF((r-l)/density,(b-t)/density)));
+                }catch(RuntimeException failure){android.util.Log.w("GlassHome","Widget size unavailable",failure);}
+            });
+        }catch(RuntimeException failure){card.addView(text("组件暂不可用",14,MUTED));}
+        else card.addView(text("组件暂不可用",14,MUTED));
+        if(editing){
+            Button edit=button("调整组件",()->workspaceWidgetMenu(item));edit.setBackground(HomeStyle.surface(edit,0xcc252b32,18));
+            FrameLayout.LayoutParams size=new FrameLayout.LayoutParams(-1,dp(44),Gravity.BOTTOM);card.addView(edit,size);
+            edit.setOnLongClickListener(v->v.startDragAndDrop(ClipData.newPlainText("小组件",item.id),new View.DragShadowBuilder(card),item.id,0));
+        }
+        return card;
+    }
+    private void workspaceWidgetMenu(HomeLayout.Item item){
+        show(new AlertDialog.Builder(this).setTitle("应用页小组件").setItems(new String[]{"组件设置","调整尺寸","前移","后移","移动到页面","移回组件栏","移除"},(d,n)->{
+            if(n==0){widgets.reconfigure(item.widgetId);return;}
+            if(n==1){
+                AppWidgetProviderInfo info=widgets.manager.getAppWidgetInfo(item.widgetId);if(info==null){message("组件暂不可用");return;}
+                List<int[]> choices=widgets.resizeChoices(info,item);
+                if(choices.size()<2){message("这个组件在当前页面没有其他可用尺寸");return;}
+                String[] labels=new String[choices.size()];int selected=0;
+                for(int i=0;i<choices.size();i++){int[] size=choices.get(i);labels[i]=size[0]+" × "+size[1];if(size[0]==item.spanX&&size[1]==item.spanY)selected=i;}
+                final int[] chosen={selected};
+                show(new AlertDialog.Builder(this).setTitle("组件尺寸").setSingleChoiceItems(labels,selected,(dialog,index)->chosen[0]=index)
+                    .setPositiveButton("应用",(dialog,index)->{int[] size=choices.get(chosen[0]);if(item.spanX==size[0]&&item.spanY==size[1])return;
+                        item.spanX=size[0];item.spanY=size[1];layout.page=layout.pageOf(item.id);save();render();})
+                    .setNegativeButton("取消",null).create());return;
+            }
+            if(n==2||n==3)layout.move(item.id,layout.items.indexOf(item)+(n==2?-1:2));
+            else if(n==4){moveToPage(item);return;}
+            else if(n==5)layout.remove(item.id);
+            else if(n==6){widgets.remove(item.widgetId);return;}
+            layout.clamp();save();render();
+        }).create());
+    }
+    private void itemMenu(HomeLayout.Item item){
+        List<String> actions=new ArrayList<>(Arrays.asList("前移","后移","移动到页面",item.folder()?"重命名文件夹":"添加到 Dock",item.folder()?"解散文件夹":"与其他图标创建文件夹","从桌面移除"));
+        show(new AlertDialog.Builder(this).setTitle(item.folder()?item.title:appLabel(item.apps.get(0))).setItems(actions.toArray(new String[0]),(d,n)->{
+            int index=layout.items.indexOf(item);
+            if(n==0)layout.move(item.id,index-1);else if(n==1)layout.move(item.id,index+2);
+            else if(n==2){moveToPage(item);return;}
+            else if(n==3){if(item.folder()){rename(item);return;}if(!layout.pin(item.apps.get(0)))message("Dock 已满，请先移除一个图标");}
+            else if(n==4){if(item.folder())layout.dissolve(item.id);else{mergePicker(item);return;}}
+            else layout.remove(item.id);save();render();
+        }).create());
+    }
+    private void moveToPage(HomeLayout.Item item){
+        int count=layout.pages();String[] pages=new String[count];for(int i=0;i<count;i++)pages[i]="第 "+(i+1)+" 页";
+        show(new AlertDialog.Builder(this).setTitle("移动到页面").setItems(pages,(d,n)->{
+            int target=layout.pageStart(n);layout.move(item.id,target+(layout.items.indexOf(item)<target?1:0));layout.page=layout.pageOf(item.id);save();render();
+        }).create());
+    }
+    private void mergePicker(HomeLayout.Item item){List<HomeLayout.Item> targets=new ArrayList<>();for(HomeLayout.Item i:layout.items)if(i!=item&&!i.widget())targets.add(i);
+        if(targets.isEmpty()){message("先添加另一个应用");return;}
+        String[] names=new String[targets.size()];for(int i=0;i<names.length;i++){HomeLayout.Item target=targets.get(i);names[i]=target.folder()?target.title:appLabel(target.apps.get(0));}
+        show(new AlertDialog.Builder(this).setTitle("合并到文件夹").setItems(names,(d,n)->{layout.merge(item.id,targets.get(n).id);save();render();}).create());}
+    private void rename(HomeLayout.Item item){EditText input=new EditText(this);input.setTextColor(TEXT);input.setSingleLine(true);input.setText(item.title);input.setSelectAllOnFocus(true);
+        show(new AlertDialog.Builder(this).setTitle("文件夹名称").setView(input).setPositiveButton("保存",(d,n)->{String name=input.getText().toString().trim();if(!name.isEmpty())item.title=name;save();render();}).setNegativeButton("取消",null).create());}
+    HomeSheet folder(HomeLayout.Item item){
+        List<String> keys=new ArrayList<>(item.apps);int columns=wide?4:3;
+        HomeSheet dialog=new HomeSheet(this,540,Math.min(560,130+((keys.size()+columns-1)/columns)*108));
+        LinearLayout header=dialog.header(item.title);
+        header.addView(button("重命名",()->{dialog.dismiss();rename(item);}),header.getChildCount()-1,new LinearLayout.LayoutParams(dp(68),dp(48)));
+        TextView hint=text(keys.size()+" 个应用 · 长按图标管理",12,MUTED);hint.setPadding(dp(4),0,0,dp(12));dialog.content.addView(hint);
+        ScrollView scroll=new ScrollView(this);scroll.setVerticalScrollBarEnabled(false);dialog.content.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
+        GridLayout grid=new GridLayout(this);grid.setTag("home-folder-grid");grid.setColumnCount(columns);scroll.addView(grid,new ScrollView.LayoutParams(-1,-2));
+        for(int i=0;i<keys.size();i++){
+            String key=keys.get(i);LinearLayout shortcut=column();shortcut.setGravity(Gravity.CENTER);shortcut.setPadding(dp(4),dp(6),dp(4),dp(6));
+            ImageView image=icon(key);shortcut.addView(image,new LinearLayout.LayoutParams(dp(52),dp(52)));
+            TextView label=text(appLabel(key),12,TEXT);label.setGravity(Gravity.CENTER);label.setMaxLines(2);label.setEllipsize(TextUtils.TruncateAt.END);label.setPadding(0,dp(6),0,0);
+            shortcut.addView(label,new LinearLayout.LayoutParams(-1,-2));shortcut.setContentDescription(appLabel(key));shortcut.setFocusable(true);
+            shortcut.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x33ffffff),null,glass(0xffffffff,18)));
+            shortcut.setOnClickListener(v->{launch(key,image);dialog.dismiss();});
+            shortcut.setOnLongClickListener(v->{v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);dialog.dismiss();folderAppMenu(item,key);return true;});
+            GridLayout.LayoutParams cell=new GridLayout.LayoutParams(GridLayout.spec(i/columns),GridLayout.spec(i%columns,1f));cell.width=0;cell.height=dp(108);grid.addView(shortcut,cell);
+        }
+        show(dialog);return dialog;
+    }
+    private void folderAppMenu(HomeLayout.Item item,String key){
+        show(new AlertDialog.Builder(this).setTitle(appLabel(key)).setItems(new String[]{"移出文件夹","添加到 Dock","应用信息"},(a,b)->{
+            if(b==0)layout.extract(item.id,key);else if(b==1){if(!layout.pin(key))message("Dock 已满");}else appInfo(key);save();render();
+        }).create());
+    }
+    private void dockMenu(String key){show(new AlertDialog.Builder(this).setTitle(appLabel(key)).setItems(new String[]{"上移","下移","从 Dock 移除","应用信息"},(d,n)->{
+        int i=layout.dock.indexOf(key);if(n==0&&i>0)Collections.swap(layout.dock,i,i-1);else if(n==1&&i<layout.dock.size()-1)Collections.swap(layout.dock,i,i+1);
+        else if(n==2)layout.dock.remove(key);else if(n==3)appInfo(key);save();render();
+    }).create());}
+    private void search(){pickApp("搜索应用",(app,source)->launch(app.key,source));}
+    HomeSheet pickApp(String title,java.util.function.BiConsumer<HomeApps.App,View> action){
+        HomeSheet dialog=new HomeSheet(this,580,580);dialog.header(title);
+        LinearLayout field=row();field.setGravity(Gravity.CENTER_VERTICAL);field.setBackground(HomeStyle.surface(field,HomeStyle.FIELD,HomeStyle.FIELD_RADIUS));
+        EditText query=new EditText(this);query.setTag("home-search-query");query.setSingleLine(true);query.setHint("搜索名称或包名");query.setTextColor(TEXT);query.setHintTextColor(MUTED);
+        query.setTextSize(16);query.setPadding(dp(14),0,dp(4),0);query.setBackgroundColor(Color.TRANSPARENT);
+        query.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH);
+        field.addView(query,new LinearLayout.LayoutParams(0,dp(52),1));
+        Button clear=button("×",()->query.setText(""));clear.setContentDescription("清空搜索");field.addView(clear,new LinearLayout.LayoutParams(dp(48),dp(48)));
+        dialog.content.addView(field,new LinearLayout.LayoutParams(-1,dp(52)));
+        TextView count=text("",12,MUTED);count.setPadding(dp(4),dp(10),0,dp(6));dialog.content.addView(count,new LinearLayout.LayoutParams(-1,dp(36)));
+        FrameLayout results=new FrameLayout(this);dialog.content.addView(results,new LinearLayout.LayoutParams(-1,0,1));
+        ListView list=new ListView(this);list.setTag("home-search-results");list.setDivider(null);list.setVerticalScrollBarEnabled(false);results.addView(list,new FrameLayout.LayoutParams(-1,-1));
+        TextView empty=text("",15,MUTED);empty.setTag("home-search-empty");empty.setGravity(Gravity.CENTER);results.addView(empty,new FrameLayout.LayoutParams(-1,-1));list.setEmptyView(empty);
+        List<HomeApps.App> filtered=new ArrayList<>(apps.values());
+        BaseAdapter adapter=new BaseAdapter(){
+            public int getCount(){return filtered.size();}public Object getItem(int p){return filtered.get(p);}public long getItemId(int p){return p;}
+            public View getView(int p,View recycled,ViewGroup parent){
+                HomeApps.App app=filtered.get(p);AppRow row=recycled instanceof AppRow?(AppRow)recycled:new AppRow();
+                row.image.setImageBitmap(app.icon);row.image.setAlpha(1f);row.name.setText(app.label);row.detail.setText(appPlacement(app));
+                row.more.setContentDescription("管理 "+app.label);row.more.setOnClickListener(v->{dialog.dismiss();appMenu(app);});
+                row.setOnClickListener(v->{if(dialog.isShowing()){action.accept(app,row.image);dialog.dismiss();}});
+                row.setOnLongClickListener(v->{v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);dialog.dismiss();appMenu(app);return true;});
+                return row;
+            }
+        };list.setAdapter(adapter);
+        Runnable filter=()->{
+            filtered.clear();String term=query.getText().toString().trim().toLowerCase(Locale.ROOT);
+            for(HomeApps.App app:apps.values())if(app.search.contains(term))filtered.add(app);
+            adapter.notifyDataSetChanged();count.setText(filtered.size()+" 个应用");clear.setEnabled(query.length()>0);
+            empty.setText(loaded?"没有找到应用\n试试其他名称或包名":loading?"正在加载应用…":"应用列表暂未加载，请稍后重试");
+        };
+        query.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence s,int st,int c,int a){}public void afterTextChanged(Editable e){}
+            public void onTextChanged(CharSequence s,int st,int before,int count){filter.run();}});
+        query.setOnEditorActionListener((v,id,event)->{
+            if(id==android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH){if(filtered.size()==1){action.accept(filtered.get(0),null);dialog.dismiss();}return true;}return false;
+        });
+        list.setOnItemClickListener((p,v,n,id)->{if(dialog.isShowing()){action.accept(filtered.get(n),v instanceof AppRow?((AppRow)v).image:v);dialog.dismiss();}});
+        catalogObservers.add(filter);dialog.setOnDismissListener(d->catalogObservers.remove(filter));filter.run();
+        show(dialog);return dialog;
+    }
+    private String appPlacement(HomeApps.App app){
+        String placement="未添加到桌面";
+        if(layout.dock.contains(app.key))placement="已在 Dock";
+        else for(int i=0;i<layout.items.size();i++)if(layout.items.get(i).apps.contains(app.key)){
+            HomeLayout.Item item=layout.items.get(i);placement=item.folder()?"文件夹 · "+item.title:"桌面第 "+(layout.pageOf(item.id)+1)+" 页";break;
+        }
+        return (app.user.equals(android.os.Process.myUserHandle())?"":"工作资料 · ")+placement;
+    }
+    private void appMenu(HomeApps.App app){
+        show(new AlertDialog.Builder(this).setTitle(app.label).setItems(new String[]{"添加到桌面","添加到 Dock","应用信息"},(d,which)->{
+            if(which==0){layout.add(app.key);for(HomeLayout.Item i:layout.items)if(i.apps.contains(app.key)){layout.page=layout.pageOf(i.id);break;}}
+            else if(which==1){if(!layout.pin(app.key))message("Dock 已满");}else appInfo(app.key);save();render();
+        }).create());
+    }
+    private final class AppRow extends LinearLayout {
+        final ImageView image;final TextView name,detail;final Button more;
+        AppRow(){
+            super(DuoHomeActivity.this);setGravity(Gravity.CENTER_VERTICAL);setPadding(dp(8),dp(8),0,dp(8));setMinimumHeight(dp(72));
+            setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x22ffffff),null,glass(0xffffffff,16)));
+            image=icon("");image.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);addView(image,new LinearLayout.LayoutParams(dp(44),dp(44)));
+            LinearLayout labels=column();labels.setPadding(dp(14),0,dp(4),0);name=text("",16,TEXT);name.setSingleLine(true);name.setEllipsize(TextUtils.TruncateAt.END);
+            detail=text("",12,MUTED);detail.setSingleLine(true);detail.setEllipsize(TextUtils.TruncateAt.END);labels.addView(name);labels.addView(detail);
+            addView(labels,new LinearLayout.LayoutParams(0,-2,1));more=button("⋯",()->{});addView(more,new LinearLayout.LayoutParams(dp(48),dp(48)));
+        }
+    }
+    private void launch(String key){launch(key,null);}
+    private void launch(String key,View source){HomeApps.App app=apps.get(key);if(app==null){message("应用暂不可用，可能已卸载或工作资料已暂停");return;}
+        Rect sourceBounds=null;
+        if(source!=null&&source.isAttachedToWindow()){
+            Rect visible=new Rect();
+            if(source.getGlobalVisibleRect(visible)){
+                // LauncherApps expects screen coordinates, not coordinates inside our root.
+                int[] location=new int[2];source.getLocationOnScreen(location);
+                sourceBounds=new Rect(location[0],location[1],location[0]+source.getWidth(),location[1]+source.getHeight());
+            }
+        }
+        // Leave animation options to the system; source bounds do not grant MIUI's
+        // private launcher/remote-transition integration.
+        try{getSystemService(LauncherApps.class).startMainActivity(app.component,app.user,sourceBounds,dualPanel()?ActivityOptions.makeBasic().setLaunchDisplayId(getDisplay().getDisplayId()).toBundle():null);}
+        catch(RuntimeException e){message("系统未能打开这个应用");}}
+    private void appInfo(String key){HomeApps.App app=apps.get(key);if(app==null)return;
+        try{getSystemService(LauncherApps.class).startAppDetailsActivity(app.component,app.user,null,null);}catch(RuntimeException e){message("无法打开应用信息");}}
+    private String appLabel(String key){HomeApps.App app=apps.get(key);if(app!=null)return app.label;
+        int slash=key.indexOf('/');return (slash<0?key:key.substring(0,slash))+"（暂不可用）";}
+    private ImageView icon(String key){ImageView view=new ImageView(this);HomeApps.App app=apps.get(key);
+        if(app==null){view.setImageDrawable(getPackageManager().getDefaultActivityIcon());view.setAlpha(.45f);}else view.setImageBitmap(app.icon);
+        view.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        view.setOutlineProvider(new ViewOutlineProvider(){@Override public void getOutline(View v,Outline outline){outline.setRoundRect(0,0,v.getWidth(),v.getHeight(),Math.min(v.getWidth(),v.getHeight())*.23f);}});
+        view.setClipToOutline(true);return view;}
+    private void menu(){
+        // Keep the action consistent with its displayed label even if recovery changes the session.
+        final boolean dualEnabled=FixedDualSession.enabled(this)||FixedDualSession.active();
+        show(new AlertDialog.Builder(this).setTitle("玻璃桌面").setItems(new String[]{"选择默认桌面","添加现有小组件","更换系统壁纸","全面屏手势","折叠动画设置","刷新应用列表",dualEnabled?"退出固定双屏（试用）":"启用固定双屏（试用）","使用说明"},(d,n)->{
+        if(n==0)requestHome();else if(n==1)widgets.choose();else if(n==2){try{startActivity(new Intent(Intent.ACTION_SET_WALLPAPER));}catch(ActivityNotFoundException e){message("未找到系统壁纸设置");}}
+        else if(n==3||n==4)startActivity(new Intent(this,DesktopActivity.class));else if(n==5)reload();
+        else if(n==6){boolean enable=!dualEnabled;FixedDualSession.setEnabled(this,enable);message(enable?"正在准备内外屏桌面":"已退出固定双屏");}
+        else show(new AlertDialog.Builder(this).setTitle("使用玻璃桌面").setMessage("左右滑动切换应用页。长按图标拖动：放到图标中心创建文件夹，放到两侧调整顺序；放到 Dock 添加常用应用。\n\n点击编辑后可调整图标、文件夹和小组件。搜索中长按应用可添加到桌面。\n\n小窗、分屏和最近任务由系统处理。可在“选择默认桌面”中切回小米桌面。").setPositiveButton("知道了",null).create());
+    }).create());}
+    private boolean isDefaultHome(){RoleManager roles=getSystemService(RoleManager.class);return roles!=null&&roles.isRoleHeld(RoleManager.ROLE_HOME);}
+    private void requestHome(){try{
+        RoleManager roles=getSystemService(RoleManager.class);
+        if(roles!=null&&roles.isRoleAvailable(RoleManager.ROLE_HOME)&&!roles.isRoleHeld(RoleManager.ROLE_HOME))startActivityForResult(roles.createRequestRoleIntent(RoleManager.ROLE_HOME),4201);
+        else startActivityForResult(new Intent(Settings.ACTION_HOME_SETTINGS),4201);
+    }catch(RuntimeException e){message("请在系统设置中选择默认桌面");}}
+    private void show(Dialog dialog){dialogs.removeIf(d->!d.isShowing());dialogs.add(dialog);dialog.show();}
+    private void message(String value){Toast.makeText(this,value,Toast.LENGTH_LONG).show();}
+    private LinearLayout column(){LinearLayout v=new LinearLayout(this);v.setOrientation(LinearLayout.VERTICAL);return v;}
+    private LinearLayout row(){LinearLayout v=new LinearLayout(this);v.setOrientation(LinearLayout.HORIZONTAL);return v;}
+    private TextView text(String value,int size,int color){TextView v=new TextView(this);v.setText(value);v.setTextSize(size);v.setTextColor(color);v.setGravity(Gravity.CENTER_VERTICAL);return v;}
+    private Button button(String label,Runnable action){Button v=new Button(this);v.setText(label);v.setTextSize(14);v.setTextColor(TEXT);v.setAllCaps(false);v.setMinWidth(0);v.setMinimumWidth(0);v.setPadding(dp(4),0,dp(4),0);v.setBackground(HomeStyle.ripple(v,HomeStyle.FIELD_RADIUS));v.setOnClickListener(w->action.run());return v;}
+    private GradientDrawable glass(int color,int radius){GradientDrawable drawable=new GradientDrawable(GradientDrawable.Orientation.TL_BR,new int[]{color,color&0x00ffffff|Math.max(0,(color>>>24)-20)<<24});drawable.setCornerRadius(dp(radius));drawable.setStroke(dp(1),0x32ffffff);return drawable;}
+}

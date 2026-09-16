@@ -17,7 +17,16 @@ public final class UpdateSecurityTest {
         check(UpdateTrust.compareVersion("v0.4.10","0.4.9")>0,"numeric version order");
         check(UpdateTrust.compareVersion("v0.4.25","0.4.25.0")==0,"equivalent versions");
         check(UpdateTrust.compareVersion("0.4.17","0.4.25")<0,"older release never offered");
-        rejects(()->UpdateTrust.compareVersion("v0.4.25-beta","0.4.25"),"ambiguous version");
+        check(UpdateTrust.compareVersion("0.4.30","0.5.0-preview.2")<0,"cached stable release compared with installed preview");
+        check(UpdateTrust.compareVersion("0.5.0","0.5.0-preview.2")>0,"final release follows preview");
+        check(UpdateTrust.compareVersion("v0.5.0-preview.10","0.5.0-preview.2")>0,"numeric preview sequence");
+        check(UpdateTrust.compareVersion("0.5.0-preview.2+local","v0.5.0-preview.2+ci.9")==0,"metadata does not affect version order");
+        check(!UpdateTrust.isStableVersion("v0.5.0-preview.2")&&UpdateTrust.isStableVersion("v0.5.0"),"update feed remains stable only");
+        String[] ordered={"0.5.0-alpha","0.5.0-alpha.1","0.5.0-alpha.beta","0.5.0-beta","0.5.0-beta.2","0.5.0-beta.11","0.5.0-rc.1","0.5.0"};
+        for(int i=0;i<ordered.length;i++)for(int j=0;j<ordered.length;j++)
+            check(Integer.signum(UpdateTrust.compareVersion(ordered[i],ordered[j]))==Integer.signum(i-j),"prerelease ordering and antisymmetry");
+        for(String invalid:new String[]{"","0.5.0-","0.5.0-preview..2","0.5.0-preview.02","0.5.0+","0.5.0/preview","0.5.0\n",null})
+            rejects(()->UpdateTrust.compareVersion(invalid,"0.5.0"),"malformed version rejected");
         check(!UpdateTrust.ownDownload(UpdateTrust.REPO+"/releases/download/../file.apk"),"tag traversal");
         check(!UpdateTrust.ownDownload("https://attacker/file.apk"),"asset URL injection");
         check(!UpdateTrust.ownRelease(UpdateTrust.REPO+"/releases/tag/v1?redirect=elsewhere"),"release confinement");
@@ -55,6 +64,6 @@ public final class UpdateSecurityTest {
             mode=3;rejects(()->new UpdateTransport().download(url,output,-1,100,file->{},message->{}),"HTTPS downgrade");
             UpdateTransport cancelled=new UpdateTransport();cancelled.cancel();rejects(()->cancelled.download(url,output,-1,100,file->{},message->{}),"cancelled download");
         }finally{try(java.util.stream.Stream<Path> paths=Files.walk(root)){for(Path path:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(path);}}
-        System.out.println("PASS: numeric versions, repository confinement, corrupt mirror failover, all-source failure, byte progress/reset/completion, size/truncation, HTTPS and cancellation");
+        System.out.println("PASS: numeric and preview versions, final-release ordering, malformed labels, repository confinement, corrupt mirror failover, all-source failure, byte progress/reset/completion, size/truncation, HTTPS and cancellation");
     }
 }

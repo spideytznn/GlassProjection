@@ -66,12 +66,14 @@ public final class ProjectionService extends AccessibilityService implements Sen
     }
     private final ExecutorService worker=Executors.newSingleThreadExecutor();
     private final HashSet<String> homes=new HashSet<>();
+    private long homesResolvedAt;
     private final FrameGate gate=new FrameGate();
     private final LockScreenGate lockGate=new LockScreenGate();
     private final FoldHoldGate holdGate=new FoldHoldGate();
     private volatile boolean foldHeld;
     private final TouchObservation touchObservation=new TouchObservation(this);
     private final FingerSwipeGate fingerSwipe=new FingerSwipeGate();
+    private GestureNavigationOverlay gestureNavigation;
     private SensorManager sensors;
     private Sensor physicalFoldSensor,directContactSensor;
     private float directContactField=Float.NaN;
@@ -80,6 +82,9 @@ public final class ProjectionService extends AccessibilityService implements Sen
     private WindowManager manager;
     private FrameLayout window;
     private boolean connected,pending,homeUncertain;
+    private volatile String foregroundWindowClass="";
+    private int foregroundWindowId=-1,recentsWindowId=-1;
+    private long recentsRequestedAt;
     private final AppBlacklist appBlacklist=new AppBlacklist();
     private boolean appScopeDirty=true;
     private long appScopeAt;
@@ -196,9 +201,47 @@ public final class ProjectionService extends AccessibilityService implements Sen
     private final DisplayManager.DisplayListener displayListener=new DisplayManager.DisplayListener(){
         public void onDisplayAdded(int id){update();} public void onDisplayRemoved(int id){update();} public void onDisplayChanged(int id){update();}
     };
+    static void refreshGestureNavigation(){ProjectionService service=instance;if(service!=null)service.main.post(()->{if(service.gestureNavigation!=null)service.gestureNavigation.refresh();});}
+    static void recentsRequested(){ProjectionService service=instance;if(service!=null){service.recentsRequestedAt=SystemClock.uptimeMillis();service.recentsWindowId=-1;}}
+    static boolean recentsVisible(){
+        ProjectionService service=instance;if(service==null)return false;
+        android.app.role.RoleManager roles=service.getSystemService(android.app.role.RoleManager.class);
+        if(roles==null||!roles.isRoleHeld(android.app.role.RoleManager.ROLE_HOME))return false;
+        for(AccessibilityWindowInfo window:service.getWindows()){
+            if(window.getType()!=AccessibilityWindowInfo.TYPE_APPLICATION||!window.isActive())continue;
+            AccessibilityNodeInfo root=window.getRoot();if(root==null)return false;
+            try{
+                String pkg=String.valueOf(root.getPackageName());
+                if(!"com.miui.home".equals(pkg)){
+                    service.recentsHadTasks=false;service.main.removeCallbacks(service.recentsWatch);
+                    // Keep the return armed until HOME receives focus. Clear it when a
+                    // task card opens another app, so a later unrelated HOME is not animated.
+                    if(!service.getPackageName().equals(pkg))DuoHomeActivity.leaveRecentsForApplication();
+                    if(service.recentsWindowId>=0){service.recentsWindowId=-1;service.recentsRequestedAt=0;}return false;
+                }
+                boolean named=window.getId()==service.foregroundWindowId&&service.foregroundWindowClass.toLowerCase(java.util.Locale.ROOT).contains("recents");
+                boolean requested=service.recentsRequestedAt>0&&SystemClock.uptimeMillis()-service.recentsRequestedAt<2000;
+                boolean hasClear=containsRecentsLabel(root,"清理任务");
+                boolean empty=containsRecentsLabel(root,"近期没有任何内容");
+                if(hasClear)service.recentsHadTasks=true;
+                if(empty&&service.recentsHadTasks){service.recentsHadTasks=false;DuoHomeActivity.requestHomeEntrance();service.performGlobalAction(GLOBAL_ACTION_HOME);}
+                if(hasClear||empty){service.main.removeCallbacks(service.recentsWatch);service.main.postDelayed(service.recentsWatch,200);named=true;}
+                if(named||requested||window.getId()==service.recentsWindowId){service.recentsWindowId=window.getId();DuoHomeActivity.observeRecents();return true;}
+                return false;
+            }finally{root.recycle();}
+        }return false;
+    }
+    private boolean recentsHadTasks;
+    private final Runnable recentsWatch=()->recentsVisible();
+    private static boolean containsRecentsLabel(AccessibilityNodeInfo node,String label){
+        if(label.contentEquals(node.getContentDescription()==null?"":node.getContentDescription())||label.contentEquals(node.getText()==null?"":node.getText()))return true;
+        for(int i=0;i<node.getChildCount();i++){AccessibilityNodeInfo child=node.getChild(i);if(child!=null)try{if(containsRecentsLabel(child,label))return true;}finally{child.recycle();}}
+        return false;
+    }
     @Override protected void onServiceConnected() {
         AnimationSettings.init(this);
         instance=this;connected=true;
+        gestureNavigation=new GestureNavigationOverlay(this);
         livePreferred=getSharedPreferences("projection",0).getBoolean("live",false);
         sensors=getSystemService(SensorManager.class);displays=getSystemService(DisplayManager.class);
         ResolveInfo home=getPackageManager().resolveActivity(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),0);
@@ -235,12 +278,13 @@ public final class ProjectionService extends AccessibilityService implements Sen
 
     }
     private boolean home() {
+        refreshHomes(false);
         homeUncertain=false;
         if(getSystemService(KeyguardManager.class).isKeyguardLocked() || !getSystemService(PowerManager.class).isInteractive())return false;
         for(AccessibilityWindowInfo w:getWindows()) {
             if(w.getType()!=AccessibilityWindowInfo.TYPE_APPLICATION || !w.isActive())continue;
             AccessibilityNodeInfo root=w.getRoot();if(root==null){homeUncertain=true;return false;}
-            try {return root.getPackageName()!=null && homes.contains(root.getPackageName().toString());}
+            try {return root.getPackageName()!=null && isHomePackage(root.getPackageName().toString());}
             finally {root.recycle();}
         }
         homeUncertain=true;return false;
@@ -255,7 +299,7 @@ public final class ProjectionService extends AccessibilityService implements Sen
             try {
                 String pkg=root.getPackageName()==null?"":root.getPackageName().toString();
                 if("com.android.systemui".equals(pkg))systemUi=true;
-                else if(w.getType()==AccessibilityWindowInfo.TYPE_APPLICATION&&!homes.contains(pkg))return -1;
+                else if(w.getType()==AccessibilityWindowInfo.TYPE_APPLICATION&&!isHomePackage(pkg))return -1;
             } finally {root.recycle();}
         }
         return systemUi?1:0;
@@ -263,6 +307,19 @@ public final class ProjectionService extends AccessibilityService implements Sen
     static void refreshAppScope(){
         ProjectionService s=instance;
         if(s!=null)s.main.post(()->{s.appScopeDirty=true;s.update();});
+    }
+    static void refreshHomeScope(){
+        ProjectionService s=instance;
+        if(s!=null)s.main.post(()->{s.refreshHomes(true);s.appScopeDirty=true;s.update();});
+    }
+    private void refreshHomes(boolean force){
+        long now=SystemClock.uptimeMillis();if(!force&&now-homesResolvedAt<2000)return;homesResolvedAt=now;
+        ResolveInfo home=getPackageManager().resolveActivity(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),0);
+        homes.clear();if(home!=null&&home.activityInfo!=null)homes.add(home.activityInfo.packageName);
+    }
+    private boolean isHomePackage(String pkg){
+        // The settings, updater and HOME share a package; package identity alone is insufficient.
+        return getPackageName().equals(pkg)?DuoHomeActivity.foreground:homes.contains(pkg);
     }
     private boolean appBlocked(long now,boolean locked){
         if(AnimationSettings.blacklistedApps.isEmpty())return false;
@@ -293,7 +350,7 @@ public final class ProjectionService extends AccessibilityService implements Sen
     private boolean motion() {return ProjectionMath.endpointOpacity(hinge,primaryInner,AnimationSettings.startAngle,foldPose.blocksProjection())>0;}
     private long[] geometry() {
         long[] value={17,0};AccessibilityNodeInfo root=getRootInActiveWindow();
-        if(root!=null)try{if(root.getPackageName()!=null && homes.contains(root.getPackageName().toString()))collect(root,value,0);}finally{root.recycle();}
+        if(root!=null)try{if(root.getPackageName()!=null && isHomePackage(root.getPackageName().toString()))collect(root,value,0);}finally{root.recycle();}
         return value;
     }
     private void collect(AccessibilityNodeInfo node,long[] value,int depth) {
@@ -312,6 +369,9 @@ public final class ProjectionService extends AccessibilityService implements Sen
     }
     private void updateState() {
         if(!connected)return;
+        FixedDualSession.maintain(this);
+        if(FixedDualSession.active()){if(gestureNavigation!=null)gestureNavigation.close();standby=!getSystemService(PowerManager.class).isInteractive();updatedAt=SystemClock.uptimeMillis();allowed=false;reset();closeWindow();return;}
+        if(gestureNavigation!=null)gestureNavigation.update();
         stateUpdates++;
         foldPose=foldPose.expireDirectContact(SystemClock.elapsedRealtimeNanos());
         hinge=foldPose.angle();
@@ -449,7 +509,13 @@ public final class ProjectionService extends AccessibilityService implements Sen
         s.updateSuspended=false;s.touchObservation.resume();MobileHelper.start(s);s.update();
     }
     static void stop() {ProjectionService service=instance;if(service!=null)service.main.post(service::disableSelf);}
-    @Override public void onAccessibilityEvent(AccessibilityEvent e){appScopeDirty=true;update();}
+    @Override public void onAccessibilityEvent(AccessibilityEvent e){
+        if(FixedDualSession.active())return;
+        if(e!=null&&e.getEventType()==AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED){if("com.miui.home".contentEquals(e.getPackageName()==null?"":e.getPackageName()))recentsVisible();return;}
+        if(e!=null&&e.getEventType()==AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED){foregroundWindowId=e.getWindowId();foregroundWindowClass=e.getClassName()==null?"":e.getClassName().toString();}
+        recentsVisible();
+        appScopeDirty=true;update();
+    }
     @Override public void onMotionEvent(MotionEvent e){
         long now=SystemClock.uptimeMillis();
         if(!AnimationSettings.swipeRestore||!touchObservation.ready()||!allowed||!e.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)
@@ -506,5 +572,5 @@ public final class ProjectionService extends AccessibilityService implements Sen
             // tick handles expiry; repeated readings need no scene/display work.
         });
     }
-    @Override public void onDestroy(){touchObservation.close();connected=false;instance=null;allowed=false;updatedAt=0;status="已停用";MobileHelper.stop();main.removeCallbacks(tick);if(mirrorPreview!=null){mirrorPreview.close();mirrorPreview=null;}reset();closeWindow();sensors.unregisterListener(this);displays.unregisterDisplayListener(displayListener);worker.shutdown();super.onDestroy();}
+    @Override public void onDestroy(){FixedDualSession.stop();touchObservation.close();if(gestureNavigation!=null){gestureNavigation.close();gestureNavigation=null;}GestureNavigation.serviceStopping(this);connected=false;instance=null;allowed=false;updatedAt=0;status="已停用";MobileHelper.stop();main.removeCallbacks(tick);if(mirrorPreview!=null){mirrorPreview.close();mirrorPreview=null;}reset();closeWindow();if(sensors!=null)sensors.unregisterListener(this);if(displays!=null)displays.unregisterDisplayListener(displayListener);worker.shutdown();super.onDestroy();}
 }

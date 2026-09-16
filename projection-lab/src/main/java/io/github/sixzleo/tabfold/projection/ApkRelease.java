@@ -10,7 +10,8 @@ final class ApkRelease {
     ApkRelease(byte[] json)throws Exception {
         JSONObject release=new JSONObject(new String(json,java.nio.charset.StandardCharsets.UTF_8));
         if(release.optBoolean("draft")||release.optBoolean("prerelease"))throw new IOException("不是正式发布版本");
-        tag=release.getString("tag_name");UpdateTrust.compareVersion(tag,tag);
+        tag=release.getString("tag_name");
+        if(!UpdateTrust.isStableVersion(tag))throw new IOException("不是正式发布版本");
         page=release.getString("html_url");if(!UpdateTrust.ownRelease(page))throw new IOException("发布链接不属于本项目");
         String body=release.optString("body","");notes=body.length()>12000?body.substring(0,12000)+"\n更多内容请查看 Release。":body;
         JSONArray assets=release.getJSONArray("assets");JSONObject selected=null,onlyApk=null;int apkCount=0;
