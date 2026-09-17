@@ -71,6 +71,7 @@ public class DuoHomeActivity extends Activity {
                 else HomeMigrator.applyAsync(ProjectionService.instance,intent.getStringExtra("layout"));
                 return;
             }
+            if(action.endsWith(".OPEN_SEARCH")){search();return;}
             openShade(intent.getIntExtra("side",HomeStatusBar.SIDE_NOTIFICATIONS));
         }
     };
@@ -83,6 +84,24 @@ public class DuoHomeActivity extends Activity {
         public void onPackagesUnavailable(String[] p,UserHandle u,boolean replacing){reload();}
     };
     boolean dualPanel(){return this instanceof DuoInnerActivity||this instanceof DuoCoverActivity;}
+    /**
+     * Sessions rebuild on fold changes; secondary homes left on stale virtual displays keep
+     * those displays in "removing" forever, and MIUI then routes task restores and resumes
+     * onto the dead displays (apps never show, recents feels stuck). Finish strays early.
+     */
+    static void validateSecondaryHomes(){
+        Set<Integer> live=FixedDualSession.activeContentIds();
+        if(FixedDualSession.active()&&live.isEmpty())return; // still preparing: no verdict yet
+        for(DuoHomeActivity a:new ArrayList<>(homeInstances)){
+            if(!(a instanceof DuoSecondaryActivity)||a.isDestroyed()||a.isFinishing())continue;
+            android.view.Display display=a.getDisplay();
+            int id=display==null?-1:display.getDisplayId();
+            if(!live.contains(id)){
+                android.util.Log.i("DuoFixed","Finishing stale secondary home on display "+id+" (live="+live+")");
+                a.finish();
+            }
+        }
+    }
     String panelStore(){return this instanceof DuoInnerActivity?"duo_inner":this instanceof DuoCoverActivity?"duo_cover":"duo_home";}
     int widgetHostId(){return this instanceof DuoInnerActivity?2702:this instanceof DuoCoverActivity?2703:2701;}
     /** Display-name mapping shared by real secondary-home instances across panels. */
@@ -115,6 +134,7 @@ public class DuoHomeActivity extends Activity {
         getSystemService(LauncherApps.class).registerCallback(appChanges,main);
         IntentFilter shadeActions=new IntentFilter();
         shadeActions.addAction(getPackageName()+".OPEN_SHADE");
+        shadeActions.addAction(getPackageName()+".OPEN_SEARCH");
         shadeActions.addAction(getPackageName()+".MIGRATE_SCAN");
         shadeActions.addAction(getPackageName()+".MIGRATE_APPLY");
         registerReceiver(shadeDebug,shadeActions,Context.RECEIVER_EXPORTED);
@@ -185,7 +205,12 @@ public class DuoHomeActivity extends Activity {
         if(resumed&&(entrancePending||entranceRunning||panelChanging||touching||(pager!=null&&pager.isInteracting()))){main.postDelayed(deliverCatalog,80);return;}
         List<HomeApps.App> found=pendingCatalog;pendingCatalog=null;
         apps.clear();for(HomeApps.App app:found)apps.put(app.key,app);
-        layout.discover(apps.keySet());if(!store.dockSeeded()){if(layout.dock.isEmpty())seedDock();if(!layout.dock.isEmpty())store.markDockSeeded();}
+        boolean fresh=layout.items.isEmpty();
+        layout.discover(apps.keySet());
+        // MiDuo-style first-launch classification: only on a virgin desktop, never over a
+        // migrated or hand-arranged layout.
+        if(fresh&&!layout.items.isEmpty()&&!store.classifiedSeeded()){HomeClassify.apply(layout,apps);store.markClassifiedSeeded();}
+        if(!store.dockSeeded()){if(layout.dock.isEmpty())seedDock();if(!layout.dock.isEmpty())store.markDockSeeded();}
         loaded=true;loading=false;save();render();notifyCatalog();if(reloadPending){reloadPending=false;reload();}
     }
     private void notifyCatalog(){for(Runnable observer:new ArrayList<>(catalogObservers))observer.run();}
@@ -256,7 +281,10 @@ public class DuoHomeActivity extends Activity {
         wide=bounds.width()/density>=600;
         root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setTag("home-root");
         root.setBackgroundColor(Color.TRANSPARENT);
-        setContentView(root);
+        FrameLayout content=new FrameLayout(this);
+        content.addView(root,new FrameLayout.LayoutParams(-1,-1));
+        if(editing)content.addView(removeOverlay());
+        setContentView(content);
         root.setOnApplyWindowInsetsListener((v,insets)->{
             Insets bars=insets.getInsets(WindowInsets.Type.systemBars()|WindowInsets.Type.displayCutout());
             v.setPadding(bars.left+dp(wide?24:12),bars.top+dp(8),bars.right+dp(wide?24:12),bars.bottom+dp(12));return insets;
@@ -282,6 +310,39 @@ public class DuoHomeActivity extends Activity {
         LinearLayout.LayoutParams dockSize=new LinearLayout.LayoutParams(dp(68),-1);dockSize.setMargins(dp(wide?16:8),0,0,0);
         body.addView(dockColumn(),dockSize);
         root.requestApplyInsets();
+    }
+    /** Drag-to-remove target shown while an edit-mode drag is in flight (MiDuo-style drop zone). */
+    private FrameLayout removeOverlay(){
+        FrameLayout overlay=new FrameLayout(this);overlay.setTag("home-remove-layer");
+        Button pill=button("拖到此处移除",()->{});
+        pill.setTextColor(0xffffd9d6);
+        pill.setBackground(glass(0x80c2504a,26));
+        pill.setVisibility(View.INVISIBLE);
+        FrameLayout.LayoutParams size=new FrameLayout.LayoutParams(dp(196),dp(48),Gravity.TOP|Gravity.CENTER_HORIZONTAL);
+        size.topMargin=dp(60);
+        overlay.addView(pill,size);
+        // The empty overlay passes ordinary touches through; it only watches drag events.
+        overlay.setOnDragListener((v,event)->{
+            if(!(event.getLocalState() instanceof String))return false;
+            switch(event.getAction()){
+                case DragEvent.ACTION_DRAG_STARTED:pill.setVisibility(View.VISIBLE);return true;
+                case DragEvent.ACTION_DRAG_LOCATION:
+                    boolean over=event.getX()>=pill.getLeft()&&event.getX()<=pill.getRight()&&event.getY()>=pill.getTop()&&event.getY()<=pill.getBottom();
+                    pill.setBackground(glass(over?0xccd95550:0x80c2504a,26));return true;
+                case DragEvent.ACTION_DROP:
+                    if(event.getX()>=pill.getLeft()&&event.getX()<=pill.getRight()&&event.getY()>=pill.getTop()&&event.getY()<=pill.getBottom()){
+                        HomeLayout.Item dropped=layout.find((String)event.getLocalState());
+                        if(dropped!=null){
+                            if(dropped.widget())widgets.remove(dropped.widgetId);else{layout.remove(dropped.id);message("已从桌面移除");}
+                            save();main.post(this::render);
+                        }
+                    }
+                    return true;
+                case DragEvent.ACTION_DRAG_ENDED:pill.setVisibility(View.INVISIBLE);pill.setBackground(glass(0x80c2504a,26));return true;
+                default:return true;
+            }
+        });
+        return overlay;
     }
     private View workspace(){
         LinearLayout panel=column();panel.setGravity(Gravity.CENTER_VERTICAL);
@@ -334,7 +395,8 @@ public class DuoHomeActivity extends Activity {
         int count=0;
         for(HomeLayout.Cell cell:layout.cells()){
             if(!loaded||cell.page!=page)continue;count++;
-            HomeLayout.Item item=cell.item;int index=layout.items.indexOf(item);
+            HomeLayout.Item item=cell.item;
+            int slot=cell.page*HomeLayout.PAGE_SIZE+cell.y*HomeLayout.COLUMNS+cell.x;
             View tile=item.widget()?workspaceWidget(item):tile(item);
             tile.setOnDragListener((v,event)->{
                 if(!(event.getLocalState() instanceof String))return false;
@@ -344,15 +406,20 @@ public class DuoHomeActivity extends Activity {
                     case DragEvent.ACTION_DRAG_ENTERED:v.setBackground(glass(0x667fe1d0,20));return true;
                     case DragEvent.ACTION_DRAG_EXITED:case DragEvent.ACTION_DRAG_ENDED:v.setBackground(null);return true;
                     case DragEvent.ACTION_DROP:
-                        if(!item.widget()&&layout.find(source)!=null&&!layout.find(source).widget()&&event.getX()>v.getWidth()*.28f&&event.getX()<v.getWidth()*.72f)layout.merge(source,item.id);
-                        else layout.move(source,index+(event.getX()>v.getWidth()*.5f?1:0));
+                        int target=slot+(event.getX()>v.getWidth()*.5f?1:0);
+                        if(source.startsWith("dock:"))layout.undock(source.substring(5),target);
+                        else{
+                            HomeLayout.Item dragged=layout.find(source);
+                            if(dragged!=null&&!dragged.widget()&&!item.widget()&&FolderFan.mergeZone(event.getX(),event.getY(),v.getWidth(),v.getHeight(),dp(46)))layout.merge(source,item.id);
+                            else layout.move(source,target);
+                        }
                         save();main.post(this::render);return true;
                     default:return true;
                 }
             });
             tile.setTag(cell);
             GridLayout.LayoutParams lp=new GridLayout.LayoutParams(GridLayout.spec(cell.y,cell.height),GridLayout.spec(cell.x,cell.width));
-            lp.width=dp(60)*cell.width;lp.height=dp(wide?96:92)*cell.height;lp.setMargins(dp(2),dp(2),dp(2),dp(2));grid.addView(tile,lp);
+            lp.width=dp(60)*cell.width;lp.height=dp(96)*cell.height;lp.setMargins(dp(2),dp(2),dp(2),dp(2));grid.addView(tile,lp);
         }
         if(!loaded||count==0){loadLabel=text(loaded?"此页没有应用\n点击下方搜索添加":"正在加载应用…",16,MUTED);loadLabel.setGravity(Gravity.CENTER);frame.addView(loadLabel,new FrameLayout.LayoutParams(-1,-1));}
         return frame;
@@ -361,7 +428,7 @@ public class DuoHomeActivity extends Activity {
         if(viewport.getHeight()<=0||grid.getChildCount()==0)return;
         int rows=HomeLayout.ROWS;
         // The cell plus its two 2 dp margins must fit every row exactly.
-        int cell=Math.max(1,Math.min(dp(wide?96:92),viewport.getHeight()/rows-dp(4)));
+        int cell=Math.max(1,Math.min(dp(96),viewport.getHeight()/rows-dp(4)));
         for(int i=0;i<grid.getChildCount();i++){
             View child=grid.getChildAt(i);HomeLayout.Cell placement=(HomeLayout.Cell)child.getTag();
             GridLayout.LayoutParams size=(GridLayout.LayoutParams)child.getLayoutParams();
@@ -375,8 +442,11 @@ public class DuoHomeActivity extends Activity {
         show(new AlertDialog.Builder(this).setTitle("跳转页面").setItems(choices,(d,n)->goToPage(n)).create());}
     private void pageDrop(View target,int direction){target.setOnDragListener((v,e)->{
         if(!(e.getLocalState() instanceof String))return false;
-        if(e.getAction()==DragEvent.ACTION_DROP){int page=Math.max(0,Math.min(layout.pages(),layout.page+direction));
-            layout.move((String)e.getLocalState(),layout.pageStart(page)+(direction>0?1:0));layout.page=page;layout.clamp();save();main.post(this::render);}
+        if(e.getAction()==DragEvent.ACTION_DROP){
+            String source=(String)e.getLocalState();int page=Math.max(0,Math.min(layout.pages(),layout.page+direction));
+            if(source.startsWith("dock:"))layout.undock(source.substring(5),page*HomeLayout.PAGE_SIZE);
+            else layout.move(source,page*HomeLayout.PAGE_SIZE+(direction>0?0:HomeLayout.PAGE_SIZE-1));
+            layout.page=page;layout.clamp();save();main.post(this::render);}
         return true;
     });}
     private View tile(HomeLayout.Item item){
@@ -395,11 +465,15 @@ public class DuoHomeActivity extends Activity {
         return tile;
     }
     private View dock(){
-        LinearLayout rail=column();rail.setTag("home-dock");rail.setPadding(dp(4),dp(12),dp(4),dp(12));rail.setGravity(Gravity.CENTER_HORIZONTAL);rail.setBackground(glass(0x55869bad,30));
-        HomeStyle.glass(rail,HomeStyle.PANEL_RADIUS);
+        LinearLayout rail=column();rail.setTag("home-dock");rail.setPadding(dp(4),dp(12),dp(4),dp(12));rail.setGravity(Gravity.CENTER_HORIZONTAL);
+        HomeStyle.glass(rail,HomeStyle.PANEL_RADIUS,HomeStyle.ROLE_DOCK);
         LinearLayout icons=column();icons.setTag("home-dock-icons");icons.setGravity(Gravity.CENTER);rail.addView(icons,new LinearLayout.LayoutParams(-1,-1));
         for(String key:layout.dock){ImageView icon=icon(key);LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(dp(48),dp(48));lp.setMargins(0,dp(6),0,dp(6));icons.addView(icon,lp);
-            icon.setContentDescription(appLabel(key));icon.setFocusable(true);icon.setOnClickListener(v->{if(editing)dockMenu(key);else launch(key,icon);});icon.setOnLongClickListener(v->{dockMenu(key);return true;});}
+            icon.setContentDescription(appLabel(key));icon.setFocusable(true);icon.setOnClickListener(v->{if(editing)dockMenu(key);else launch(key,icon);});
+            // MiDuo dock behaviour: long-press drags the icon out; editing mode keeps the menu.
+            icon.setOnLongClickListener(v->{if(editing){dockMenu(key);return true;}
+                v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                return v.startDragAndDrop(ClipData.newPlainText("Dock图标","dock:"+key),new View.DragShadowBuilder(v),"dock:"+key,0);});}
         if(editing&&layout.dock.size()<HomeLayout.DOCK_SIZE){Button add=button("＋",()->pickApp("添加到 Dock",(app,source)->{if(layout.pin(app.key)){save();render();}}));add.setContentDescription("添加到侧边 Dock");icons.addView(add,new LinearLayout.LayoutParams(-1,dp(52)));}
         rail.setOnDragListener((v,e)->{if(!(e.getLocalState() instanceof String))return false;
             if(e.getAction()==DragEvent.ACTION_DROP){HomeLayout.Item item=layout.find((String)e.getLocalState());
@@ -409,14 +483,15 @@ public class DuoHomeActivity extends Activity {
     }
     private View dockColumn(){
         LinearLayout column=column();column.setGravity(Gravity.CENTER_HORIZONTAL);
-        LinearLayout.LayoutParams railSize=new LinearLayout.LayoutParams(-1,dp(264));railSize.topMargin=dp(wide?64:52);column.addView(dock(),railSize);
+        LinearLayout.LayoutParams railSize=new LinearLayout.LayoutParams(-1,dp(264));railSize.topMargin=dp(64);column.addView(dock(),railSize);
         column.addView(new View(this),new LinearLayout.LayoutParams(1,0,1));
-        Button search=button("⌕",this::search);search.setContentDescription("搜索应用");search.setTextSize(22);HomeStyle.glass(search,24);
-        column.addView(search,new LinearLayout.LayoutParams(dp(48),dp(48)));return column;
+        Button search=button("⌕",this::search);search.setContentDescription("搜索应用");search.setTextSize(22);
+        HomeStyle.glass(search,26,HomeStyle.ROLE_FLOATING);
+        column.addView(search,new LinearLayout.LayoutParams(-1,dp(52)));return column;
     }
     private View widgetPanel(){
-        LinearLayout panel=column();panel.setTag("home-widgets");panel.setPadding(dp(12),dp(12),dp(12),dp(12));panel.setBackground(glass(0x28466077,28));
-        HomeStyle.glass(panel,HomeStyle.PANEL_RADIUS);
+        LinearLayout panel=column();panel.setTag("home-widgets");panel.setPadding(dp(12),dp(12),dp(12),dp(12));
+        HomeStyle.glass(panel,HomeStyle.PANEL_RADIUS,HomeStyle.ROLE_FRAME);
         LinearLayout heading=row();
         TextView title=text("今天",20,TEXT);heading.addView(title,new LinearLayout.LayoutParams(0,dp(46),1));
         heading.addView(button("＋",widgets::choose),new LinearLayout.LayoutParams(dp(48),dp(46)));panel.addView(heading);
@@ -437,18 +512,18 @@ public class DuoHomeActivity extends Activity {
                 controls.addView(button("设置",()->widgetMenu(id)),new LinearLayout.LayoutParams(dp(60),dp(44)));card.addView(controls);}
             try{
                 AppWidgetHostView view=widgets.view(id,info);if(view.getParent() instanceof ViewGroup)((ViewGroup)view.getParent()).removeView(view);
-                view.setPadding(0,0,0,0);
-                HomeStyle.rounded(view,HomeStyle.PANEL_RADIUS);
+                HomeWidgetScale holder=new HomeWidgetScale(this,view,info);
+                HomeStyle.rounded(holder,HomeStyle.PANEL_RADIUS);
                 int minimum=widgetDp(info.minResizeHeight>0?info.minResizeHeight:info.minHeight);
                 int defaultHeight=Math.max(120,widgetDp(info.minHeight));int height=Math.max(minimum,store.widgetHeight(id)==0?defaultHeight:store.widgetHeight(id));
-                card.addView(view,new LinearLayout.LayoutParams(-1,dp(height)));
-                if(view.getTag()==null){view.setTag(Boolean.TRUE);view.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->{
-                    if(r-l>0&&(r-l!=or-ol||b-t!=ob-ot)){
+                card.addView(holder,new LinearLayout.LayoutParams(-1,dp(height)));
+                holder.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->{
+                    if(r-l>0&&b-t>0&&(r-l!=or-ol||b-t!=ob-ot)){
                         float scale=getResources().getDisplayMetrics().density;
                         try{view.updateAppWidgetSize(new Bundle(),Collections.singletonList(new android.util.SizeF((r-l)/scale,(b-t)/scale)));}
                         catch(RuntimeException failure){android.util.Log.w("GlassHome","Widget size update unavailable: "+id,failure);}
                     }
-                });}
+                });
             }catch(RuntimeException e){card.addView(text("这个小组件暂时无法显示",14,MUTED));card.addView(button("移除",()->widgets.remove(id)));}
         }
         ScrollView scroller=widgetScroll;scroller.post(()->scroller.scrollTo(0,widgetScrollY));return panel;
@@ -460,7 +535,7 @@ public class DuoHomeActivity extends Activity {
         Button widgetButton=button("小组件",()->switchPanel(true));
         applications.setTextSize(13);widgetButton.setTextSize(13);
         applications.setTextColor(widgetsPage?MUTED:TEXT);widgetButton.setTextColor(widgetsPage?TEXT:MUTED);
-        HomeStyle.glass(widgetsPage?widgetButton:applications,17,0x50343b43);
+        HomeStyle.glass(widgetsPage?widgetButton:applications,17,HomeStyle.ROLE_CONTROL);
         switcher.addView(applications,new LinearLayout.LayoutParams(0,-1,1));
         switcher.addView(widgetButton,new LinearLayout.LayoutParams(0,-1,1));return switcher;
     }
@@ -475,7 +550,7 @@ public class DuoHomeActivity extends Activity {
                 else{Path p=new Path();p.moveTo(5,12);p.lineTo(10,17);p.lineTo(19,7);c.drawPath(p,ink);}c.restore();
             }
         };icon.setPadding(0,0,0,0);icon.setMinWidth(0);icon.setMinimumWidth(0);icon.setOnClickListener(v->action.run());icon.setContentDescription(label);icon.setTooltipText(label);
-        HomeStyle.glass(icon,22,0x50343b43);icon.setForeground(HomeStyle.ripple(icon,22));return icon;
+        HomeStyle.glass(icon,22,HomeStyle.ROLE_FLOATING);icon.setForeground(HomeStyle.ripple(icon,22));return icon;
     }
     private boolean panelChanging;
     private void switchPanel(boolean target){
@@ -520,8 +595,9 @@ public class DuoHomeActivity extends Activity {
         if(info!=null)try{
             AppWidgetHostView hosted=widgets.view(item.widgetId,info);
             if(hosted.getParent() instanceof ViewGroup)((ViewGroup)hosted.getParent()).removeView(hosted);
-            hosted.setPadding(0,0,0,0);card.addView(hosted,new FrameLayout.LayoutParams(-1,-1));
-            card.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->{
+            HomeWidgetScale holder=new HomeWidgetScale(this,hosted,info);
+            card.addView(holder,new FrameLayout.LayoutParams(-1,-1));
+            holder.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->{
                 if(r>l&&b>t&&(r-l!=or-ol||b-t!=ob-ot))try{
                     float density=getResources().getDisplayMetrics().density;
                     hosted.updateAppWidgetSize(new Bundle(),Collections.singletonList(new android.util.SizeF((r-l)/density,(b-t)/density)));
@@ -556,7 +632,8 @@ public class DuoHomeActivity extends Activity {
         final int[] chosen={selected};
         show(new AlertDialog.Builder(this).setTitle("组件尺寸").setSingleChoiceItems(labels,selected,(dialog,index)->chosen[0]=index)
             .setPositiveButton("应用",(dialog,index)->{int[] size=choices.get(chosen[0]);if(item.spanX==size[0]&&item.spanY==size[1])return;
-                item.spanX=size[0];item.spanY=size[1];layout.page=layout.pageOf(item.id);save();render();})
+                if(!layout.resize(item.id,size[0],size[1])){message("这个尺寸会与其他内容重叠");return;}
+                layout.page=layout.pageOf(item.id);save();render();})
             .setNegativeButton("取消",null).create());
     }
     private void workspaceWidgetMenu(HomeLayout.Item item){
@@ -564,7 +641,7 @@ public class DuoHomeActivity extends Activity {
             if(n==0){widgets.reconfigure(item.widgetId);return;}
             if(n==3){moveToPage(item);return;}
             if(n==5){widgets.remove(item.widgetId);return;}
-            if(n==1||n==2)layout.move(item.id,layout.items.indexOf(item)+(n==1?-1:2));
+            if(n==1||n==2)layout.move(item.id,Math.max(0,item.slot)+(n==1?-1:1)*HomeLayout.COLUMNS);
             else if(n==4)layout.remove(item.id);
             layout.clamp();save();render();
         }).create());
@@ -572,8 +649,7 @@ public class DuoHomeActivity extends Activity {
     private void itemMenu(HomeLayout.Item item){
         List<String> actions=new ArrayList<>(Arrays.asList("前移","后移","移动到页面",item.folder()?"重命名文件夹":"添加到 Dock",item.folder()?"解散文件夹":"与其他图标创建文件夹","从桌面移除"));
         show(new AlertDialog.Builder(this).setTitle(item.folder()?item.title:appLabel(item.apps.get(0))).setItems(actions.toArray(new String[0]),(d,n)->{
-            int index=layout.items.indexOf(item);
-            if(n==0)layout.move(item.id,index-1);else if(n==1)layout.move(item.id,index+2);
+            if(n==0)layout.move(item.id,Math.max(0,item.slot)-1);else if(n==1)layout.move(item.id,Math.max(0,item.slot)+1);
             else if(n==2){moveToPage(item);return;}
             else if(n==3){if(item.folder()){rename(item);return;}if(!layout.pin(item.apps.get(0)))message("Dock 已满，请先移除一个图标");}
             else if(n==4){if(item.folder())layout.dissolve(item.id);else{mergePicker(item);return;}}
@@ -583,7 +659,7 @@ public class DuoHomeActivity extends Activity {
     private void moveToPage(HomeLayout.Item item){
         int count=layout.pages();String[] pages=new String[count];for(int i=0;i<count;i++)pages[i]="第 "+(i+1)+" 页";
         show(new AlertDialog.Builder(this).setTitle("移动到页面").setItems(pages,(d,n)->{
-            int target=layout.pageStart(n);layout.move(item.id,target+(layout.items.indexOf(item)<target?1:0));layout.page=layout.pageOf(item.id);save();render();
+            layout.move(item.id,n*HomeLayout.PAGE_SIZE);layout.page=layout.pageOf(item.id);save();render();
         }).create());
     }
     private void mergePicker(HomeLayout.Item item){List<HomeLayout.Item> targets=new ArrayList<>();for(HomeLayout.Item i:layout.items)if(i!=item&&!i.widget())targets.add(i);
@@ -598,17 +674,60 @@ public class DuoHomeActivity extends Activity {
         return result;
     }
     HomeSheet folder(HomeLayout.Item item){
-        List<String> keys=new ArrayList<>(item.apps);int columns=wide?4:3;
-        HomeSheet dialog=new HomeSheet(this,540,Math.min(560,130+((keys.size()+columns-1)/columns)*108));
+        List<String> keys=new ArrayList<>(item.apps);int columns=3,perPage=columns*columns;
+        int pages=(keys.size()+perPage-1)/perPage;
+        int rows=Math.min(columns,(keys.size()+columns-1)/columns);
+        // Fullscreen borderless blur (user preference): the folder fills the window.
+        HomeSheet dialog=new HomeSheet(this,360,560,false,true);
         LinearLayout header=dialog.header(item.title);
         View fan=new HomeFolderIcon(this,previews(keys));fan.setBackground(glass(0x668ca3b9,13));
         LinearLayout.LayoutParams fanSize=new LinearLayout.LayoutParams(dp(44),dp(44));fanSize.rightMargin=dp(10);
         header.addView(fan,0,fanSize);
         header.addView(button("重命名",()->{dialog.dismiss();rename(item);}),header.getChildCount()-1,new LinearLayout.LayoutParams(dp(68),dp(48)));
         TextView hint=text(keys.size()+" 个应用 · 长按图标管理",12,MUTED);hint.setPadding(dp(4),0,0,dp(12));dialog.content.addView(hint);
-        ScrollView scroll=new ScrollView(this);scroll.setVerticalScrollBarEnabled(false);dialog.content.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
-        GridLayout grid=new GridLayout(this);grid.setTag("home-folder-grid");grid.setColumnCount(columns);scroll.addView(grid,new ScrollView.LayoutParams(-1,-2));
-        for(int i=0;i<keys.size();i++){
+        if(pages<=1){
+            ScrollView scroll=new ScrollView(this);scroll.setVerticalScrollBarEnabled(false);dialog.content.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
+            scroll.addView(folderPage(dialog,item,keys,0,keys.size(),columns),new ScrollView.LayoutParams(-1,-2));
+            blankTapCloses(scroll,dialog);
+        }else{
+            // MiDuo-style folder panel: 3x3 pages with dot indicators.
+            HomePager pagesView=new HomePager(this);pagesView.setTag("home-folder-pager");
+            pagesView.setAdapter(new PagerAdapter(){
+                @Override public int getCount(){return pages;}
+                @Override public boolean isViewFromObject(View view,Object page){return view==page;}
+                @Override public Object instantiateItem(ViewGroup container,int position){
+                    GridLayout page=folderPage(dialog,item,keys,position*perPage,Math.min(keys.size(),(position+1)*perPage),columns);
+                    container.addView(page);return page;
+                }
+                @Override public void destroyItem(ViewGroup container,int position,Object page){container.removeView((View)page);}
+            });
+            TextView counter=text(pageDots(0,pages),13,MUTED);counter.setGravity(Gravity.CENTER);
+            pagesView.addOnPageChangeListener(new ViewPager.SimpleOnPageChangeListener(){
+                @Override public void onPageSelected(int position){counter.setText(pageDots(position,pages));}
+            });
+            dialog.content.addView(pagesView,new LinearLayout.LayoutParams(-1,0,1));
+            blankTapCloses(pagesView,dialog);
+            counter.setPadding(0,dp(8),0,dp(4));dialog.content.addView(counter,new LinearLayout.LayoutParams(-1,-2));
+        }
+        show(dialog);return dialog;
+    }
+    /** Fullscreen folder: a clean tap (no drag) on blank area closes the sheet. */
+    private void blankTapCloses(View view,HomeSheet dialog){
+        final float[] down=new float[2];final long[] at=new long[1];
+        view.setOnTouchListener((v,e)->{
+            switch(e.getActionMasked()){
+                case MotionEvent.ACTION_DOWN:down[0]=e.getX();down[1]=e.getY();at[0]=e.getDownTime();break;
+                case MotionEvent.ACTION_UP:
+                    if(Math.abs(e.getX()-down[0])<dp(8)&&Math.abs(e.getY()-down[1])<dp(8)&&e.getEventTime()-at[0]<300)dialog.dismiss();
+                    break;
+            }
+            return false;
+        });
+    }
+    /** One 3-column page of a folder sheet; [from,to) is the member index range. */
+    private GridLayout folderPage(HomeSheet dialog,HomeLayout.Item item,List<String> keys,int from,int to,int columns){
+        GridLayout grid=new GridLayout(this);grid.setTag("home-folder-grid");grid.setColumnCount(columns);
+        for(int i=from;i<to;i++){
             String key=keys.get(i);LinearLayout shortcut=column();shortcut.setGravity(Gravity.CENTER);shortcut.setPadding(dp(4),dp(6),dp(4),dp(6));
             ImageView image=icon(key);shortcut.addView(image,new LinearLayout.LayoutParams(dp(52),dp(52)));
             TextView label=text(appLabel(key),12,TEXT);label.setGravity(Gravity.CENTER);label.setMaxLines(2);label.setEllipsize(TextUtils.TruncateAt.END);label.setPadding(0,dp(6),0,0);
@@ -616,9 +735,9 @@ public class DuoHomeActivity extends Activity {
             shortcut.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x33ffffff),null,glass(0xffffffff,18)));
             shortcut.setOnClickListener(v->{launch(key,image);dialog.dismiss();});
             shortcut.setOnLongClickListener(v->{v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);dialog.dismiss();folderAppMenu(item,key);return true;});
-            GridLayout.LayoutParams cell=new GridLayout.LayoutParams(GridLayout.spec(i/columns),GridLayout.spec(i%columns,1f));cell.width=0;cell.height=dp(108);grid.addView(shortcut,cell);
+            GridLayout.LayoutParams cell=new GridLayout.LayoutParams(GridLayout.spec((i-from)/columns),GridLayout.spec((i-from)%columns,1f));cell.width=0;cell.height=dp(108);grid.addView(shortcut,cell);
         }
-        show(dialog);return dialog;
+        return grid;
     }
     private void folderAppMenu(HomeLayout.Item item,String key){
         show(new AlertDialog.Builder(this).setTitle(appLabel(key)).setItems(new String[]{"移出文件夹","添加到 Dock","应用信息"},(a,b)->{
@@ -629,9 +748,10 @@ public class DuoHomeActivity extends Activity {
         int i=layout.dock.indexOf(key);if(n==0&&i>0)Collections.swap(layout.dock,i,i-1);else if(n==1&&i<layout.dock.size()-1)Collections.swap(layout.dock,i,i+1);
         else if(n==2)layout.dock.remove(key);else if(n==3)appInfo(key);save();render();
     }).create());}
-    private void search(){pickApp("搜索应用",(app,source)->launch(app.key,source));}
-    HomeSheet pickApp(String title,java.util.function.BiConsumer<HomeApps.App,View> action){
-        HomeSheet dialog=new HomeSheet(this,580,580);dialog.header(title);
+    private void search(){pickApp("搜索应用",(app,source)->launch(app.key,source),true);}
+    HomeSheet pickApp(String title,java.util.function.BiConsumer<HomeApps.App,View> action){return pickApp(title,action,false);}
+    HomeSheet pickApp(String title,java.util.function.BiConsumer<HomeApps.App,View> action,boolean bottom){
+        HomeSheet dialog=new HomeSheet(this,580,580,bottom);dialog.header(title);
         HomeSearchList<HomeApps.App> search=new HomeSearchList<>(this,"home-search-query","home-search-results","home-search-empty","搜索名称或包名");
         dialog.content.addView(search,new LinearLayout.LayoutParams(-1,0,1));
         BaseAdapter adapter=new BaseAdapter(){
@@ -658,6 +778,7 @@ public class DuoHomeActivity extends Activity {
         });
         search.list.setOnItemClickListener((p,v,n,id)->{if(dialog.isShowing()){action.accept(search.visible.get(n),v instanceof AppRow?((AppRow)v).image:v);dialog.dismiss();}});
         catalogObservers.add(search.filter);dialog.setOnDismissListener(d->catalogObservers.remove(search.filter));search.refresh();
+        if(bottom)search.query.post(()->{search.query.requestFocus();search.query.setSelection(search.query.getText().length());});
         show(dialog);return dialog;
     }
     private String appPlacement(HomeApps.App app){
@@ -710,12 +831,10 @@ public class DuoHomeActivity extends Activity {
         view.setOutlineProvider(new ViewOutlineProvider(){@Override public void getOutline(View v,Outline outline){outline.setRoundRect(0,0,v.getWidth(),v.getHeight(),Math.min(v.getWidth(),v.getHeight())*.23f);}});
         view.setClipToOutline(true);return view;}
     private void menu(){
-        // Keep the action consistent with its displayed label even if recovery changes the session.
-        final boolean dualEnabled=FixedDualSession.enabled(this)||FixedDualSession.active();
-        show(new AlertDialog.Builder(this).setTitle("玻璃桌面").setItems(new String[]{"选择默认桌面","添加现有小组件","更换系统壁纸","全面屏手势","折叠动画设置","刷新应用列表",dualEnabled?"退出固定双屏（试用）":"启用固定双屏（试用）","使用说明"},(d,n)->{
+        // Fixed dual is permanent for users; the toggle survives only as an adb switch.
+        show(new AlertDialog.Builder(this).setTitle("玻璃桌面").setItems(new String[]{"选择默认桌面","添加现有小组件","更换系统壁纸","全面屏手势","折叠动画设置","刷新应用列表","使用说明"},(d,n)->{
         if(n==0)requestHome();else if(n==1)widgets.choose();else if(n==2){try{startActivity(new Intent(Intent.ACTION_SET_WALLPAPER));}catch(ActivityNotFoundException e){message("未找到系统壁纸设置");}}
         else if(n==3||n==4)startActivity(new Intent(this,DesktopActivity.class));else if(n==5)reload();
-        else if(n==6){boolean enable=!dualEnabled;FixedDualSession.setEnabled(this,enable);message(enable?"正在准备内外屏桌面":"已退出固定双屏");}
         else show(new AlertDialog.Builder(this).setTitle("使用玻璃桌面").setMessage("左右滑动切换应用页。长按图标拖动：放到图标中心创建文件夹，放到两侧调整顺序；放到 Dock 添加常用应用。\n\n点击编辑后可调整图标、文件夹和小组件。搜索中长按应用可添加到桌面。\n\n小窗、分屏和最近任务由系统处理。可在“选择默认桌面”中切回小米桌面。").setPositiveButton("知道了",null).create());
     }).create());}
     private boolean isDefaultHome(){RoleManager roles=getSystemService(RoleManager.class);return roles!=null&&roles.isRoleHeld(RoleManager.ROLE_HOME);}

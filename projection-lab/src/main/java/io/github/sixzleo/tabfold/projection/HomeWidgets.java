@@ -79,7 +79,9 @@ final class HomeWidgets {
     private void configure(int id){
         AppWidgetProviderInfo info=manager.getAppWidgetInfo(id);
         if(info==null){cancelPending();message("小组件绑定未完成");return;}
-        if(info.configure!=null){
+        // Providers may flag their configure step as optional (MiDuo does the same check).
+        boolean optional=(info.widgetFeatures&AppWidgetProviderInfo.WIDGET_FEATURE_CONFIGURATION_OPTIONAL)!=0;
+        if(info.configure!=null&&!optional){
             try{host.startAppWidgetConfigureActivityForResult(activity,id,0,CONFIGURE,null);}
             catch(RuntimeException e){cancelPending();message("无法打开小组件设置");}
         }else complete(id);
@@ -107,15 +109,15 @@ final class HomeWidgets {
     }
     int[] defaultSpan(AppWidgetProviderInfo info){
         float[] geometry=gridGeometry();
-        return new int[]{defaultSpan(info.targetCellWidth,info.minWidth,geometry[0],geometry[2]),defaultSpan(info.targetCellHeight,info.minHeight,geometry[1],geometry[2])};
+        return new int[]{defaultSpan(info.targetCellWidth,info.minWidth,geometry[0],geometry[2],HomeLayout.COLUMNS),
+            defaultSpan(info.targetCellHeight,info.minHeight,geometry[1],geometry[2],HomeLayout.ROWS)};
     }
     private float[] gridGeometry(){
         float density=activity.getResources().getDisplayMetrics().density;
         android.view.View grid=activity.getWindow().getDecorView().findViewWithTag("home-app-grid");
         android.view.View viewport=grid!=null&&grid.getParent() instanceof android.view.View?(android.view.View)grid.getParent():null;
         float cellWidth=viewport!=null&&viewport.getWidth()>0?viewport.getWidth()/(float)HomeLayout.COLUMNS:80*density;
-        boolean wide=activity.getWindowManager().getCurrentWindowMetrics().getBounds().width()/density>=600;
-        float rowPitch=(wide?100:96)*density;
+        float rowPitch=96*density;
         float cellHeight=viewport!=null&&viewport.getHeight()>0?Math.min(rowPitch,viewport.getHeight()/(float)HomeLayout.ROWS):rowPitch;
         return new float[]{cellWidth,cellHeight,(HomeLayout.COLUMNS)*density};
     }
@@ -127,7 +129,7 @@ final class HomeWidgets {
         }
         return result;
     }
-    static int defaultSpan(int target,int pixels,float cell,float margin){return Math.max(1,Math.min(4,target>0?target:(int)Math.ceil((pixels+margin)/Math.max(1,cell))));}
+    static int defaultSpan(int target,int pixels,float cell,float margin,int max){return Math.max(1,Math.min(max,target>0?target:(int)Math.ceil((pixels+margin)/Math.max(1,cell))));}
     private boolean cancelPending(){
         int id=store.pendingWidget();
         if(!store.cancelWidget()){message("无法保存组件状态，请稍后重试");return false;}

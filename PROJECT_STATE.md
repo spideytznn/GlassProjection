@@ -1,8 +1,133 @@
 # PROJECT_STATE
 
-- 日期：2026-09-17（凌晨）
+- 日期：2026-09-17（上午）
 - 分支：duo-ui-preview
-- 本阶段：**桌面原生布局迁移引擎端到端打通**（图标/文件夹/dock 完整迁移 ✓，widget 差授权确认流）；上一晚的 shade 全套改动与迁移代码**均未提交 git**
+- 本阶段：**固定双屏默认化（隐藏而非删除传统投影）+ 桌面预览双重前置校验 + MiDuo 参考实现搬运**；已装机验证 FixedDualSession running；全部改动未提交 git
+
+## 固定双屏默认化 + 预览校验 + MiDuo 搬运（第二十三轮，2026-09-17 上午）
+
+- **默认双屏（隐藏不删除，用户拍板）**：`FixedDualSession.enabled` 默认 false→true（老用户不动开关直接进双屏）；传统投影全链保留休眠（双屏 active 本就提前 return）；`DuoHomeActivity.menu()` 移除"固定双屏（试用）"项；DesktopActivity 作用范围/恢复正常画面/切屏时机三组分区按 `legacy=!enabled` 隐藏（blur/stretch/startAngle 滑条保留，FixedDualGpu 在用）；AnimationSettings/GestureNavigation 未动。**恢复传统模式**：`adb shell content call --uri content://io.github.sixzleo.tabfold.projection.surface --method fixed-dual-session --arg 0`（已改持久化 pref，arg 1 恢复双屏）。
+- **预览前置校验**：`DesktopActivity.openDesktop()` 先 ROLE_HOME（缺→弹"去设置"，onActivityResult 重查）再 `ProjectionService.instance`（缺→弹窗跳无障碍），双过才启动桌面；按钮改"打开桌面"。
+- **MiDuo 搬运**（对照 参考/MiDuo-实现分析.md）：新增 `HomeWidgetScale`（UNSPECIFIED→EXACTLY 测量+provider min 兜底+等比缩小居中；DOWN 递归命中可交互子 View→requestDisallowInterceptTouchEvent 防 pager/scroll 抢手势；两处挂载点换用，尺寸推送挂包装层）；configure 增加 `WIDGET_FEATURE_CONFIGURATION_OPTIONAL` 跳过；`FolderFan.mergeZone` MiDuo 热区公式替换 28%~72% 框；编辑态根视图外包 content FrameLayout+拖拽中可见的顶部"拖到此处移除"胶囊（空 overlay 穿透触摸）；`folder()` 改 3×3 分页+页点（`folderPage()`）；`HomeApps` 静态 catalog 缓存（label 未变复用位图）。**未搬及原因**：伪 widget 时钟/天气（新功能族另开一轮）、pending 四元组（id 直查无增益）、挤开移动（list remove+insert 等价）、预置分类夹（待迁移稳定）、DuoGlass 参数（视觉刚定稿不盲调）。
+- **装机**：旧包为异机 debug key（INSTALL_FAILED_UPDATE_INCOMPATIBLE）→ run-as 备份 shared_prefs(317KB 含 duo_home 布局)→卸载→安装→**首启前**流式恢复→adb 重授权（enabled_accessibility_services/accessibility_enabled/appops SYSTEM_ALERT_WINDOW+WRITE_SETTINGS/cmd notification allow_listener/cmd package set-home-activity，全部生效）。冒烟：桌面启动无崩溃、入场动画正常；用户连 helper 后 **FixedDualSession running（双渲染器出帧，外屏截图像素统计确认为正常桌面内容）**；`cmd role holders` 子命令不存在（用 resolve-activity -c HOME 验证）。
+- **环境**：Gradle 8.7 wrapper 缓存曾损坏（仅 .part）已手动修复（curl --ssl-no-revoke 下载+sha256 校验+解压+.ok 标记）；构建命令 `JAVA_HOME=<JDK17> ./gradlew.bat -I tools/mirror-init.gradle.kts :projection-lab:assembleDebug --offline`。**换机构建签名不同必走备份/卸载/恢复**。
+
+## 玻璃参数/文件夹/自动分类直接采用 MiDuo（第二十四轮，2026-09-17 上午）
+
+- **玻璃参数（DuoGlass 角色表）**：`HomeStyle` 新增 7 个角色材质 `{blurDp, 模糊时填充α, 无模糊回退α}`（基色 0xff121b1f，MiDuo 深色基色）+ `glassSurface/glass(view,radius,role)`；`HomeGlass.apply` 增加 fill+双α 重载——模糊生效时填充降到低α（透明感），模糊不可用/关闭时自动升到回退α（保证可读），detach 时复位。挂载点映射：dock 栏=Dock(22dp/.055/.36)、组件栏容器=WidgetFrame(18/.035/.25)、搜索与编辑按钮=Floating(20/.08/.56)、应用/小组件分段=Control(15/.04/.30)、文件夹图标=Control（桌面）/Folder（面板头部）、HomeSheet=Card(22/.065/.40)、下拉控制面板=Screen(28/.11/.78，GlassFade 基色换 0xff121b1f 由 HomeGlass 驱动α)。旧 `glass(view,radius,color)` 删除；红色移除胶囊/拖拽高亮等功能色保留。
+- **文件夹语义（MiDuo k0）**：`HomeLayout.extract()` 移出成员后落到**文件夹旁**（文件夹消失时占其原位），不再甩到最后一页尾部；其余语义（剩1降级、merge 追加去重、dissolve 原地展开）经比对本就等价，未动。
+- **自动分类（MiDuo O6 全量移植）**：新增 `HomeClassify`——12 组首屏常用候选（图库/设置/时钟/文件/微信/支付宝/小红书/地图/米家/应用商店/日历/天气，每组多包名互换）+ 10 个固定 id 分类夹（AI/影音视听/体育运动/时尚购物/效率办公/聊天社交/新闻资讯/实用工具/旅行交通/金融理财，共 ~90 组包名候选，组内首个命中即取，共用 used 集防重复），**≥2 命中才建夹**；布局=首屏常用+拼音序补满 20 格，分类夹从第 2 页开始。接入点 `applyPendingCatalog`：仅当**首次目录到达时桌面仍为空**（fresh）且未标记 `classified_seeded` 才执行——已迁移/手排布局永不触发（真机验证 duo_home 无分类 id）。面板 store 构造时同步置位。
+- 装机验证：同签名覆盖安装，桌面存活无崩溃，helper 自动重连，FixedDualSession running，无 GlassHomeMaterial 告警（模糊正常）。**自动分类路径未真机触发**（需全新桌面），依赖代码审查。
+
+## 应用页面全量照搬 MiDuo（第二十五轮，2026-09-17 上午）
+
+- **HomeLayout 重写为 MiDuo 槽位模型**：每条目持有 `slot`（page*24+y*4+x，MiDuo 密度 **4×6=24 格/页**，原 4×5）；`move()` 实现 A2.d 挤开语义（空格直落/占用格向源方向顺移一位/widget 目标拒绝且挡道的 widget 使整个顺移作废/widget 只能落全空矩形）；`dissolve` 首成员占文件夹原格、其余向后找空位；`extract` 落文件夹旁；`pin` **dock 与桌面互斥**（入坞即下格）；`undock`（MiDuo 非桌面源：空格直落/占用则顺延到后一个空位）；`resize` 仅在自身空矩形内放行；`ensurePlaced` 兜底打包未定位条目（旧数据/导入器自动迁移）。`grid()` 跳过未定位条目、放置即 touch()——这两点是为修真 bug（首版 grid 把未定位条目假映射到 0 号格 + ensurePlaced 不失效缓存导致槽位碰撞）。
+- **JVM 单测**（/tmp/slotest，11 项全过）：迁移打包/顺序、挤开方向、widget 固定与自由移动、merge 保位、extract 相邻、dissolve 首成员占位、pin 互斥、undock 落位、resize 校验。
+- **HomeStore**：item JSON 增写 `slot`；旧数据无 slot 读取时自动按原顺序打包（真机验证：153 条目全部定位 0..152 连续无缝，布局保序）。
+- **DuoHomeActivity 适配**：拖放/菜单全部槽位化（前移后移=相邻格、widget 前后移=±一行、移动到页面=页首格）；**dock 图标非编辑态长按可直接拖出到桌面**（"dock:"+key 源）；resize 应用前走 layout.resize 校验并提示重叠；文件夹面板宽度 540→360dp（MiDuo 紧凑卡）。
+- **FolderFan**：换 MiDuo 四角钉边几何（成员 38%、10% 内缩，原居中 45%）。
+- **HomeWidgets.defaultSpan** 上限参数化（x≤COLUMNS=4，y≤ROWS=6）；HomeWidgetPicker 预估同步改。
+- 装机验证：install -r 无崩溃，dual session running，旧布局自动迁移成功（slot 字段已落盘）。**注意 prefs 内 JSON 是 &quot; 转义存储，grep 验证要用转义模式**。
+
+## 密度回退/面板同步/密度补偿/搜索重做（第二十六轮，2026-09-17 中午）
+
+- **页密度回 4×5**（用户反馈 4×6 太挤）+ **FolderFan 恢复原设计**（居中 45%，弃 MiDuo 四角 38%）。**网格版本迁移**：encode 写 `grid` 标记（"4x5"）；read 时标记与当前密度不符 → 按 slot 排序保视觉顺序、清 slot 重打包（真机 153 条目保序重排 0..152、8 页 ✓）。
+- **双屏面板同步主桌面**（修"双屏看不见文件夹"）：原面板 store 只在首次创建时拷一次种子。现 **duo_home 每次保存递增 layout_rev，面板 store 构造发现 rev 不一致即重新镜像**（保留面板自己的 widget 重打包）。实测 duo_inner/duo_cover 均含"系统工具"文件夹。
+- **内外屏布局不一致**三因：①compact/wide 常数分叉（dock 顶边距 52/64、格子 92/96、行距 100/96）→ 统一 64/96/96；②两屏同报 440dpi 但真实 PPI 不同（外 385.288/内 381.913，仅 SurfaceFlinger 视口可见）→ **compensatedDensity：外屏虚拟显示密度≈444**（ROM 把 metrics.xdpi 归一成 440 读不出真值，lhasa 按视口实测比值兜底）；③诊断教训：**SurfaceFlinger regionblur 日志刷爆 logcat 缓冲**，一次性启动日志秒没 → 诊断改写进 FixedDualSession.status（provider 可读 `dpi=inner/cover`；旧会话 440/440，补偿后应 440/444，**待解锁确认**）。
+- **弹层方形灰底修复**：HomeSheet 的 Dialog 窗口主题默认方形背景透出圆角外 → `getWindow().setBackgroundDrawable(transparent)`。
+- **搜索重做（MiDuo 风格）**：触发器=dock 栏底部 68×52 玻璃圆角方形（Floating）；搜索面板改**底部弹出**（HomeSheet 新增 bottom 变体：BOTTOM 锚定、上滑入场、键盘 ALWAYS_VISIBLE、自动聚焦光标置尾）；pickApp 加 bottom 参数，search() 走底部变体，其余选择器保持居中。
+- **最近任务结论**：反编译确认 MiDuo 的 RECENTS 只是手势枚举→交回系统；第三方无自绘任务列表 API。现状=虚拟屏 am 启动 MIUI recents。**待用户定夺**。
+- 装机运维：MIUI force-stop 后解绑无障碍（adb settings put 恢复）；helper 重连卡住时起一次 DesktopActivity 即恢复；锁屏时 maintain 不拉会话（设计行为）。
+
+## 文件夹全屏模糊底（第二十七轮，2026-09-17 下午）
+
+- **用户需求**：文件夹点开后模糊底直接铺满全屏（不要带边距的面板）；搜索弹框保留圆角卡片但修掉方形灰框；应用页文件夹图标还原原样式（蓝灰 glass，已还原）。
+- **"方形外框"根因（两层）**：①`HomeGlass` 圆角裁剪代码因**缺 import（ViewOutlineProvider/Outline）从未编译进包**——之前多轮 "BUILD SUCCESSFUL" 实为 gradle 增量状态错乱的**假构建**（APK 时间戳不变、新字符串不在 dex 里），装的都是旧代码；修复 import 后必须**删 APK 重建+校验 dex 标记+比对时间戳**三件套确认产物真的更新。②HyperOS `setBackgroundBlur` 的圆角参数在这版 ROM 被忽略（模糊区退化为方形）→ `HomeGlass` 构造时统一 `setOutlineProvider+setClipToOutline` 把填充/描边/模糊整体裁成圆角。
+- **全屏模糊未铺满的真正原因**：`outside` 容器被系统栏 insets 加了 padding（左右 16dp、状态栏+12dp、导航+12dp），模糊面板和 scrim 只能画在 padding 之内 → padding 露出一圈**清晰未模糊壁纸** = 用户看到的"外框"（像素证据：面板宽 1080=1168−2×44px，44px=16dp 精确吻合）。**修复**：fullscreen 分支不再给 outside 加 padding，insets 转为 content 内部 padding（头部避开状态栏），模糊/遮罩铺满整窗。**验证**：打开文件夹后四角清晰度 stddev 1.8~2.0（纯糊）vs 中心图标区 49.9（高细节），视觉确认边缘全糊。
+- 构建教训入库：**判别假构建三件套**——删产物重建、`unzip -p apk classes*.dex | grep <新字符串标记>`、ls 时间戳。
+- **点空白退出（用户需求）**：全屏文件夹 content 自身 onClick=dismiss（覆盖头部/留白区），滚动容器与分页器挂 `blankTapCloses` 观察器（ACTION_UP 位移<8dp 且 <300ms 即 dismiss，返回 false 不干扰滚动/翻页；子控件图标自己消费点击不冒泡）。真机两轮实测：开→糊角 1.8，点空白→回到桌面 ✓。
+- 装机运维补充：MIUI force-stop 后解绑无障碍需 adb 重写 `enabled_accessibility_services`；helper 断线重连卡住时启动一次 DesktopActivity 即恢复；`dpi=440/440` 补偿值 444 已写入 FixedDualSession.status 待下次会话重建生效（lhasa 真实 PPI 比值兜底，metrics.xdpi 被 ROM 归一读不出）。
+
+## 搜索弹窗方角修复（第二十八轮，2026-09-17 下午）
+
+- **根因确认（截图+角部放大）**：HyperOS `setBackgroundBlur(int,float[])` 的圆角参数在此 ROM 被忽略，视图级 `clipToOutline` 管不到 SurfaceFlinger 合成的模糊层 → 卡片圆角外四个角露出方形模糊斑。
+- **修复**：①弹窗（HomeSheet）改用**标准窗口级模糊** `FLAG_BLUR_BEHIND + LayoutParams.setBlurBehindRadius(40dp)`（API 31 公开 setter；注意 `blurBehindRadius` 字段本身编译不可见，必须用 setter），内容卡换 `HomeStyle.glassStatic`（圆角渐变填充+rounded 裁剪，**不再挂视图层 HomeGlass**，避免双重模糊与方角）；②`HomeGlass` 圆角参数数组改传 8 值（部分 ROM 只认 8 值格式），保住 dock/控制面板等仍在用视图层模糊的场景。
+- **验证**：角部放大图卡片圆角干净、无方形斑块，模糊透过卡片可见（窗口模糊生效），外部壁纸清晰；像素扫描卡片边界 x=48..1122、顶部 y=160=状态栏+12dp ✓。
+- 构建教训再次确认：`blurBehindRadius` 字段编译不可见需用 setter；每次改完用"删 APK 重建+dex 标记"三件套。
+
+## 方角终极修复：反编译 HyperOS framework 找到根因（第二十九轮，2026-09-17 下午）
+
+- **用户反馈 dock 也有方角 → 判定同一类问题，且要求保留系统模糊 API（拒绝了壁纸快照假模糊方案，HomeBackdrop 已删）**。
+- **根因（反编译真机 framework.jar 实锤）**：`android.view.View.updateBackgroundBlur()`（framework.jar:17862）对 `setBackgroundBlur(radius,float[])` 的数组长度分派：**length==4** → `setUseMiCornerRadii(false)` + `BackgroundBlurDrawable.setCornerRadius(r0..r3)`（写入 8 个标准字段 mCornerRadiusTLX..BRY，**会被发布进 SurfaceFlinger 的 BlurRegion**）；**length==8** → `setUseMiCornerRadii(true)` + `setMiCornerRadii(arr)`（只写 MI 专用字段 `mMiCornerRadii`，**这 ROM 的 SurfaceFlinger 对第三方窗口不读 MI 字段** → 发布的 cornerRadii=[0×8] → 方形模糊区）。**运行时证据**：`dumpsys SurfaceFlinger` 里 blurRegions 的 cornerRadii 全为 [0×8]，而 radius（61/55/50）与我们的配置精确对应。
+- **修复**：`HomeGlass` 圆角数组回归 **4 值**（同样值×4）。修复后 SurfaceFlinger 转储：dock/组件面板/按钮/搜索条所有区域 cornerRadii=[77/61/72×8] 非零 ✓，dock 方角消失（用户确认）。
+- **搜索弹窗仍方角的第二根因**：MIUI 把 Dialog 窗口**收缩到内容视图边界**（窗口转储 frame=[29,614]...非全屏），窗口 dim/边界只盖卡片，圆角外露方形暗框。**修复**：①stage 全屏容器（卡片放 stage 内按 gravity 定位）；②窗口 `setFitInsetsTypes(0)`+`FLAG_LAYOUT_IN_SCREEN` 强制真全屏；③insets 从 outside padding 改为**卡片 margin**（不缩窗口）；④resize() 扣除 margin 计算可用尺寸。**最终截图验证：四角干净、模糊透卡、外部均匀压暗 ✓**。
+- 调试广播新增 `<pkg>.OPEN_SEARCH`（打开搜索面板，配合装机验证）。
+- **诊断方法论沉淀**：①模糊问题直接 `dumpsys SurfaceFlinger | grep cornerRadii` 看系统收到的区域参数，一眼定位是应用没传对还是系统没实现；②窗口尺寸问题看 `dumpsys window windows` 的 Frames frame=[]；③logcat 会被 SurfaceFlinger regionblur 日志刷爆，别依赖它看一次性日志。
+- framework 反编译产物在 `C:/Users/spideytznn/AppData/Local/Temp/fw/fwsrc/`（jadx，含完整 MI 模糊体系：setMiBackgroundBlurRadius/Type/Path、setPassWindowBlurEnabled、getSupportedMiBlur 门控等，后续调模糊可再查）。
+- 附带：点空白退出（全屏文件夹）已实现在 14:34 包中并实测通过。
+
+## 双屏最近任务问题（第三十轮进行中，2026-09-17 傍晚，用户指示先提交晚点修）
+
+- **用户报告（双屏模式专属，单屏正常）**：①recents 点"清理全部"后停在空态页，不回桌面；②点任务卡片应用不跳转（偶尔卡死/无反应）；通知中心点通知同样无法进应用。
+- **已定位的证据**：①旧会话留下**僵尸虚拟屏**（display 454/447 卡在 removing），MIUI 把任务恢复/resume 路由到死屏 → 应用永远不显示（日志 `Skipping resume: display id=xxx is removing` + `moveTaskToFront` 成功但画面不变）；②MIUI recents 空态在虚拟屏上不会自动退出，且文案有两种：全屏"近期没有任何内容" / 小卡片"无近期任务"。
+- **已实施的修复（装机 18:5x 日志版）**：①`FixedDualSession.activeContentIds()` + `DuoHomeActivity.validateSecondaryHomes()`——maintain/close 时自动 finish 掉不在当前会话的 DuoSecondaryActivity（实测日志 `Finishing stale secondary home on display 472` ✓）；②`ProjectionService.checkDualRecentsEmpty`——双屏时监听 com.miui.home 活动窗口，匹配两种空态文案后对该 display 发 HOME（主屏路径已实测触发；虚拟屏路径加了 `recents watch display=... empty=...` 调试日志待观察）。
+- **未收尾**：①虚拟屏上点卡片→应用跳转的完整复测（僵尸清理后预期恢复，未验证）；②通知中心点通知进应用（同一根因，未单独验证）；③validateSecondaryHomes 在 maintain 每 tick 调用，成本低但可再收敛。
+- 注意：双屏会话中弹出"选择默认桌面"系统弹窗会黑屏片刻（用户遇到后自愈）。
+
+### 下一步
+
+1. 用户手测：合并热区手感、拖到顶部移除、文件夹 >9 成员分页、widget 缩放与滑动手势共存、锁屏/解锁双屏表现（结合下方锁屏调研结论）。
+2. 验证 adb arg 0 恢复传统模式后 legacy 分区重现、arg 1 回双屏。
+3. 候选：内置自绘时钟/天气 widget（MiDuo 负 slot）、预置自动分类文件夹、锁屏黑帘保活方案。
+4. 验证满意后提交 git（连同 shade/迁移遗留一起）。
+
+## 弹窗玻璃"先暗后亮"修复（2026-09-17，代码已改未构建）
+
+- 现象：文件夹全屏弹窗 / 搜索底部弹窗打开时，模糊背景先偏暗，随后一次性跳变变亮（非渐变）。
+- 根因与下拉面板"先闪黑"同源（第二十四轮 DuoGlass 双 α 引入）：HomeSheet 经 `HomeStyle.glass` 初始化填充时用**回退 α**（文件夹 ROLE_SCREEN=.78、搜索 ROLE_CARD=.40，`HomeStyle.java` glassSurface/flatSurface）；`HomeGlass` 等异步 `addCrossWindowBlurEnabledListener` 回调（本机实测约 100ms/5-6 帧）后 `BLUR.invoke` 创建模糊层并 `syncFill()` 把填充**瞬切**到模糊 α（.11/.065，无动画）→ "先暗后突然变亮"。主题 dim(0.25)+scrim(0x52) 恒定/渐变只压暗，非变亮来源。
+- **修复（只改 `HomeStyle.glass()` 一处，自动覆盖全部 7 个调用点：两个弹窗+dock 栏+搜索按钮+组件面板+分段控件+文件夹图标）**：①`glass()` 在 `HomeGlass.apply` 接管填充后立即把初始 α 设为 role[1]（模糊 α）——监听器晚几帧到达时 syncFill 目标值相同，跳变消失；②`HomeGlass.apply` 返回值 void→boolean：ROM 缺模糊 API（反射 Method 为 null）时返回 false，fill 保持回退 α 不被改亮（非 HyperOS ROM 可读性不回归）；③update()/onPreDraw() 两条失败 catch 补 `fill.setAlpha(fallbackAlpha)`（此前失败路径会停在构造时 α）。glassSurface 注释同步修正；glassStatic（静态兜底面，现无调用者）不受影响。
+- **未构建未装机**（用户指示构建晚点再说）：下次构建走"删 APK 重建+dex 标记+时间戳"三件套；装后验证文件夹/搜索打开无暗→亮跳变（模糊层到达时的"清晰→磨砂"柔过渡保留，与下拉面板手感一致）。
+
+## 下拉面板"先闪黑"排查+修复（2026-09-17 下午，已修复装机验证，未提交 git）
+
+- **根因（logcat 时间线实锤）**：`HomeControlPanel` 面板背景 `GlassFade(0xff121b1f)` 构造时先置**回退 α .78**（`HomeControlPanel.java:143`），`HomeGlass` 要等异步 `addCrossWindowBlurEnabledListener` 回调 + `BLUR.invoke` 创建模糊层后才把填充降到 .11（`HomeGlass.java:69-91`）。真机广播复现（OPEN_SHADE side 0，虚拟屏 321 镜像路径）：窗口 show 15:24:57.130 → MIUI 记录 `mMiBlurUsed:false` 57.171 → SF 首次画 shade 模糊层 `regionblurRadius:77`（=28dp×2.75）57.223。**93ms/5-6 帧近黑相位**后瞬间变玻璃 = 用户看到的"先闪黑一下"。第二十四轮 DuoGlass 双 α 角色化引入（此前固定 0x8c tint 无此相位）。
+- **修复①（已回滚）**：HomeGlass attach 时同步调 `isCrossWindowBlurEnabled()` 预置模糊——时间线完美（show→regionblur 15ms/1 帧）但**用户手测"顿一下"**（同步 binder 调用+BLUR.invoke 在 addView 路径上拖慢首帧），已回滚（dex 标记清零确认）。
+- **修复②（现行，HomeControlPanel.java:143 一行）**：初始填充直接用 **blur α .11**（原为回退 α .78）——构造期就定好，**零同步调用零额外开销**；模糊层照旧 ~117ms 后异步建立（背景清晰→磨砂的柔和过渡），若 ROM 回报模糊不可用监听器自动加深回 .78。装机验证：show 16:31:38.021 → regionblur 38.138（117ms，异步如预期）、0 GlassHomeMaterial 告警；黑相位在代码路径上不可能出现（首帧前 α 已是 .11）。**待用户手测确认手感**。
+- **重装后会话不自动恢复的坑**：连装两次后 fixed-dual 停在 idle，telemetry 显示"连续投影助手未连接"——**起一次 DesktopActivity（am start -n PKG/.DesktopActivity）即恢复**（helper 重连），再 HOME 回桌面；本次恢复后 content=353（虚拟屏 id 已变）。
+- **并行会话干扰实证**：本会话期间另一进程改了 DuoHomeActivity(15:36)/HomeSheet(15:40)/HomeStyle(15:24)（mtime 还原），我的两次 Edit 报"file modified since read"即此因；15:40/15:47/16:28 三次构建均含这些外来改动（用户反馈"另一进程改的时候下拉好像正常"的时期对应 fix① 包 15:41-15:47，无法归因，未深究——用户指示直接修）。
+- **次级问题（未动，"打开偏慢"优化项）**：触发→窗口 show 约 255ms（56.875 广播→57.130 show），主线程构造整块面板（windowContext+相机枚举找 torch+双 pane+通知列表）；相机枚举可后台化。
+- **取证教训**：物理屏 `screenrecord --display-id <SF大编号>` **录不到 a11y overlay 层**（全程 11 帧全同、1.92fps，只有底层 DuoHomeActivity），取证 a11y overlay 必须 `screencap -d`（含全合成）或看 SurfaceFlinger logcat 时间线；MSYS_NO_PATHCONV=1 下 adb pull 目标不能写 /c/...（进目录用相对路径）。
+- **旁路发现**：物理屏最顶部（状态栏区，y≈20）注入滑动会打到**原生 SystemUI**（backgroundBlur mergeSnapshot 报错，我们的面板不开）——状态栏输入消费者优先于 overlay；用户实际下拉起点略低才命中我们的条/转发层。若后续报"顶部下拉无反应"优先查这里。
+- 环境：设备 IP 换为 192.168.2.166（端口轮换，mdns 查）；工具目录迁移到 `C:/vsCodeProject/tools/`（platform-tools/adb、jdk17、gradle-8.7、android-sdk）；本机 Python312+PIL，`pip install imageio-ffmpeg`（清华镜像）拿 ffmpeg 抽帧。
+
+## 原生下拉"镜像"可行性调研（2026-09-17 下午，已完成，未改代码）
+
+- **结论：纯"遮罩+镜像原生 shade"是死路；可行的是"镂空让位直接露出"（首选）或"让位+采集重排"（次选）**。根因三条：①像素镜像只能拍到源屏**合成结果**——display 0 的 shade 被我们自己的 OPAQUE 输出窗盖住（a11y overlay 层 31 > NOTIFICATION_SHADE 层 17），不先让位则任何镜像看到的都是自己的窗；②SystemUI shade 窗口的 SurfaceControl 第三方拿不到（WMS 侧 mirrorDisplay 需 READ_FRAME_BUFFER 系统权限），只能整屏镜像；③把 display 0 的镜像挂回 display 0 的窗口 = SurfaceFlinger 层环（深度 50 致命中止，系统级崩溃），只能镜像到 display 1。
+- **路线 A（推荐）镂空让位**：shade 打开时 display 0 输出窗视觉镂空（输出窗本就整窗 NOT_TOUCHABLE，只需透明）+ forwarder 触摸窗缩窗避让该矩形 → 原生 shade 物理露出、真实触摸直达（滚动/甩动/输入全原生、零延迟）。限制：只能出现在 display 0 的物理位置（=双屏视觉底部），方向/可读性待真机验证。
+- **路线 B（次选）MediaProjection 全屏采集重排**：接入 FixedDualGpu 作第二输入纹理，可自由摆放/旋转/跨屏。代价：Android 14+ 每会话 consent 弹窗（会被自己 overlay 盖住，须进双屏前授权 + mediaProjection FGS 常驻）、30-100ms 延迟；**关键未验证点：全屏采集是否含自身 overlay 窗口**（含则同样要先让位，价值大减）。
+- **已排除**：SurfaceControl.mirrorSurface（上述①②③全中；HiddenApiBypass 可绕 blocklist 但救不了遮挡与递归）；a11y takeScreenshot 轮询（百 ms 级 + 同样含自身 overlay）。
+- **现成基建可复用**：开合原生 shade = svc 白名单 `cmd statusbar expand-notifications / expand-settings / collapse`（已实证作用于 display 0，HyperOS 通知/控制分体正好两命令对应左右半条）；shade 开合检测可监听 a11y TYPE_WINDOW_STATE_CHANGED（systemui 包名）；连续触摸注入管线（FixedDualContentHost 的 setDisplayId+injectInputEvent）可复用于镜像区转发（display 0 forwarder 须同步避让防自环）。
+- **待真机验证**：①expand-notifications 后截外屏图看 shade 物理位置/方向/可读性；②MediaProjection 全屏采集是否含自身 overlay；③shade 展开时 IME/焦点表现（通知回复场景）；④display 0 forwarder 缩窗后底部 HOME/返回手势让位的代价。
+
+## 锁屏接管可行性调研（2026-09-17 下午，已完成，未改代码）
+
+- **结论：完整接管系统锁屏（替换认证界面）不可能**（TYPE_KEYGUARD_DIALOG 需系统权限，HyperOS 不开放）。**可行的是"视觉接管 + 会话保活"**：TYPE_ACCESSIBILITY_OVERLAY 本就压在 keyguard 之上（GestureNavigationOverlay 锁屏时主动隐藏即为旁证；非固定模式"连续锁屏投影"也是 overlay 盖锁屏），可自绘锁屏界面；虚拟屏本身永远没有 keyguard（keyguard 只挂 display 0）。
+- **"锁屏没效果"根因**：会话的锁检测只挂在 Choreographer.doFrame 循环里（`FixedDualSession.java:75-76` locked→close()），熄屏后 vsync 停、close() 可能不执行；两个 OPAQUE 全屏输出窗盖住物理屏一切（含 keyguard）；虚拟屏 DuoSecondaryActivity 不受 keyguard 管辖。docs/FIXED-DUAL-DESKTOP.zh-CN.md:142 已列为未完成项。
+- **"解锁进桌面闪一下"根因**：锁屏→会话 close()（撤输出窗/虚拟屏/拓扑请求）→解锁后 maintain()（ProjectionService.java:430，40ms tick）≤40ms 内全套重建：拓扑请求+输出窗+VirtualDisplay+**全新 DuoSecondaryActivity 实例**（onCreate→store.read→render() 整棵视图树重建，DuoHomeActivity.java:249-285），窗口透明+SHOW_WALLPAPER 期间裸露壁纸；display 0 的 DuoHomeActivity 每次解锁回桌面还播 260ms 入场动画（alpha0+scale .965，DuoHomeActivity.java:200-235）。
+- **推荐方案（未实施）**：锁屏时不 close()，保活虚拟屏与 Activity，用 FixedDualOutput 现成"黑帘 View"做锁屏纱罩，ACTION_USER_PRESENT（+isKeyguardLocked 轮询兜底）掀帘→零重建零闪烁，可进一步在帘上画玻璃锁屏（时钟/通知）。**安全关键：锁屏期间必须禁用触摸转发层（NOT_TOUCHABLE），否则触摸直达虚拟屏桌面=未解锁可操作/启动应用**（这也是作者 close() 的原始动机）。display 0 的入场动画可按"解锁返回"跳过/缩短。
+- 待真机验证：锁屏期间 shell 持有的 VirtualDisplay/拓扑请求（state 5/6）是否存活；黑帘在亮屏瞬间是否立即可见；虚拟屏 Activity 锁屏期间是否保持 resumed。
+
+## 澎湃OS 4 性能范式调研（2026-09-17，已完成，未改代码）
+
+- HyperCore 优化演进：OS2 微架构调度器（解析指令流水线，CPU 空转 -19%/高负载 IPC +16%/关键线程调度延时 -46%）→ OS3 热点编译加速 + 窗口绘制下沉（窗口动画丢帧 -18.9%、桌面图标渲染负载最高 -60%）→ OS4 负载精算 + 内存预载 + 全新应用运行环境（内存占用 -25%+、30 应用启动总耗时 -17.5%）。**全部在内核/调度器/ART/SurfaceFlinger 层，应用自动受益，无应用侧 API 可接入**；dev.mi.com 澎湃OS 文档中心无独立性能分类，应用侧范式 = Android 官方最佳实践 + 小米"系统适配"文档（其中桌面适配/小部件适配与我们直接相关）。
+- 技术栈确认：**纯 Java（无 Rust、无自有 C++），传统 View 手工 UI，AGSL+RenderEffect+GLES 渲染**；minSdk 33/targetSdk 35，**未配 release buildType（R8/minify 默认关）**、无 Baseline Profiles。
+- 可落地优化候选（性价比排序）：① release 开 R8 + shrinkResources（当前零配置，免费收益最大）② Baseline Profiles（launcher 属重启动路径应用）③ 图标两级缓存（MiDuo 待借鉴项，正对应系统"桌面图标渲染负载"优化方向）④ onDraw 分配审查 + LruCache 系统化 ⑤ HandlerThread 关键线程命名（便于系统调度器识别关键线程）。**不引入 Rust/C++**（瓶颈不在 native 计算层，安卓 Rust 用于系统组件而非应用性能范式）。**补充查证（同日）**：小米确以 Rust+Flutter 重写自家核心系统应用——OS3.1 起天气/图库移除 MIUI SDK，OS4 扩展至系统桌面 Launcher 7.0/电话/日历/文件管理等（Beta 包名带 -R 后缀，Android 17 无线 adb 亦 Rust 化）；动机=清 MIUI 包袱+模块化+人车家多端统一。**均为小米内部系统组件，未向第三方开放 Rust SDK，对本项目技术栈结论无影响**。
+
+## MiDuo 参考桌面逆向分析（2026-09-17 上午，已完成）
+
+- 对象：`参考/MiDuo-1.0.5.apk`（com.jake.duolauncher，Compose 桌面）；jadx 装在 `C:/vsCodeProject/tools/jadx`，反编译源码在 `参考/miduo-decompiled/sources`，**完整分析报告见 `参考/MiDuo-实现分析.md`**（含 file:line）。
+- 关键结论：widget 绑定链路与本项目 HomeWidgets 几乎一致（bindIfAllowed+系统弹窗，无静默绑定）；多出可借鉴点 = pending widget 四元组中断恢复、`widgetFeatures` 判 configure、**负数 slot 内置伪 widget（时钟/天气/日历自绘，绕开 MIUI 私有 provider）**、span 优先 targetCellWidth/Height、HostView 缩放包装+可交互子 View 命中拦截；文件夹 = `folder:<uuid>` 格位占位 + 独立 folders 列表、拖拽重叠合并热区公式 min(cellW*0.82, 1.35*iconSize)、打开面板 3×3 分页玻璃浮层、预置自动分类夹（固定 UUID+包名候选+≥2 才建）。
+- **第二轮（--show-bad-code 重反编译到 `参考/miduo-simple/`，skipped 全清零）已补齐**：图标预览确认 2×2 取前 4（成员 38% 尺寸、背景圆角 24%、Control 玻璃）；**剩 1 个成员自动解散、末位 app 回填文件夹原格位**；格位移动"挤开不交换"（widget 格不可推、桌面/dock 互斥）；落点权重 folder=3>widget=2>格=1、删除区最先；DuoGlass 九角色参数表（blur/noise/elevation/pressedScale，含深色与按下修正）；图标两级缓存（磁盘只存元数据+占位图标，扫完换真图）+ Collator 本地化排序。详见 `参考/MiDuo-实现分析.md` 第三、四节。
 
 ## 迁移引擎现状（第二十一轮，HomeMigrator）
 
@@ -277,3 +402,56 @@ cmd notification allow_listener io.github.sixzleo.tabfold.projection/io.github.s
 - run-as 不能写 /data/local/tmp（SELinux）；备份用 `exec-out ... tar cf - | base64` 流式。
 - MIUI 安装弹窗按钮匹配必须精确 text=="继续安装"（标题"USB安装提示"也含"安装"二字，误点标题=超时被拒）。
 - 旧教训仍有效：Activity 不能建 TYPE_ACCESSIBILITY_OVERLAY；TYPE_APPLICATION_OVERLAY 压不过系统栏；管道吃退出码；MSYS_NO_PATHCONV=1；logcat/javac 中文 GBK。
+
+## 诊断：双屏桌面帧率 60Hz 锁死（2026-09-17）
+
+- 现象：双屏模式桌面帧率不高。`dumpsys display` 实测两个内容虚拟屏（Duo inner/cover content）`renderFrameRate 60.0`，supportedModes 仅 `fps=60.0`、`alternativeRefreshRates=[]`（内外物理面板本身 120Hz）。
+- 根因：`FixedDualContentHost.create` 建 VirtualDisplay 时从未调 `Surface.setFrameRate`，HyperOS 按无提示默认生成 60Hz 单模式；桌面 DuoSecondaryActivity 跑在该虚拟屏上，Choreographer 只能 60Hz。
+- 次因：`FixedDualGpu.draw` 用 `worker.postDelayed(this,8)` 轮询替代 vsync 驱动，非对齐有 4–8ms 抖动；源提到 120 后此周期需换 Choreographer 或缩短。
+- **修复（2026-09-17 已装机验证）**，三层：
+  1. 虚拟屏：`FixedDualContentHost.create` 改用 API 35 `VirtualDisplayConfig.Builder.setRequestedRefreshRate(120f)`（`setFrameRate` 投票与 `cmd display set-user-preferred` 对虚拟屏都无效，模式表创建时按 60 生成）；minSdk 33 保留旧路径+投票兜底。
+  2. 主屏：HyperOS 自适应静态时把主屏降到 60，应用 Choreographer 跟主屏 vsync。overlay 窗口 `preferredRefreshRate=120` HyperOS 不理（代码保留）。有效方案：helper 在首个内容屏创建时 exec `cmd display set-user-preferred-display-mode W H 120 0 false`（W/H 解析 `wm size -d 0`），`close()` 时 clear；已有用户 preference 不动。
+  3. GPU 采样：`FixedDualGpu` 轮询 8ms→4ms。
+- 验证：虚拟屏 renderFrameRate 120.0；主屏动画时 120.00003、静态回落 60（MIUI 自适应行为，preferred 无法钉死 render rate）；presented==source 无积压。
+- 遗留：装机后 helper/Shizuku 绑定恢复可能要等 ~1 分钟（status=idle），耐心或 `am start .DesktopActivity`；`helper-connect` 是无线通路专用（需外部 binder），别拿来诊断 Shizuku 路径。
+- **翻页体感 60 复查（2026-09-17）**：注入 `input -d <虚拟屏> swipe` 实测，翻页期间帧产出满 120（gfxinfo 中位帧耗 5ms、jank 1%、面板 ramp 到 120 ≤350ms）。非锁帧/掉帧，体感来自：①面板从 idle 60 爬到 120 有 ≤350ms 延迟，短动画前半段常在 60；②ViewPager 固定时长缓动（总时长与 60 时代相同）。可选优化：反射换 ViewPager Scroller（更短 settle + decelerate 曲线）；手机设置里把刷新率从自适应改成固定 120 可消掉爬升（耗电换体感）。
+- **翻页 settle 优化（2026-09-17 已装机）**：`HomePager` 构造时反射替换 `ViewPager.mScroller`（viewpager 1.1.0，字段名已从反编译源确认），settle 时长 `0.55×` 映射并夹 160–320ms（库内原值：慢放 150–200ms、fling 最长 600ms + MAX_SETTLE_DURATION 上限），曲线维持五次 ease-out；ReflectiveOperationException 静默回退库行为。装机冒烟：翻页帧流正常、jank 0.83%。调参入口在 `HomePager` 的 `startScroll` 重写（系数 0.55 / 下限 160 / 上限 320）。
+- **翻页 20% 提交阈值（2026-09-17 已装机）**：用户要求拖过 20% 页宽即提交（原库为半页规则；实测反编译确认低速分支阈值其实是 0.4/0.6 truncator、且 `pageOffset` 取自滚动位置）。实现：`HomePager.dispatchTouchEvent` 在 `direction==1` 且 UP、|dx|≥0.2×width 时把 UP 改为 ACTION_CANCEL（库对 CANCEL 只 endDrag 不起回弹），随后自己 `setCurrentItem(current±1,true)` 走平滑滚动；<20% 原样透传（stock 回弹）。调参：0.2f 那处。
+- **失败方案（重要）**：曾用"改写 UP 坐标进提交区"——无效且有害：低速分支根本不读 UP 坐标，而 VelocityTracker 会把改写跳变当成真实速度，8% 左滑也会幻影提交。任何"改坐标"类 hack 都要先查 VelocityTracker 污染。
+- **测试方法沉淀**：`content=A,B` 的 A/B 是创建完成序不是固定 inner/cover——用 `dumpsys display` viewport 里 "Duo cover content" 字样定位（注意 uniqueId 含逗号，grep 模式别用 `[^,]+`）；`input -d <id> swipe` 的末速度恒定=距离/时长，低于 ViewConfiguration 最小 fling 速度（50dp/s）才会走半页取整分支；页码持久化在 `duo_cover.xml` 的 `&quot;page&quot;:N`（run-as 可读）；物理屏 screencap 对比法会被秒级时钟污染，勿用。
+- **双屏 vs 单屏体感差异定位（2026-09-17）**：单屏（DuoHomeActivity 直绘物理屏）不卡、双屏卡 → 差异在管线跳数：触摸 overlay→binder→helper 注入（+1 跳）、渲染虚拟屏→SurfaceTexture→GL→物理窗口合成（+2 跳）。刷新率请求已全部到位（preferred mode + min_refresh_rate=120 + TextureView ALWAYS 投票），MIUI 自适应空闲仍回 60 属系统策略。
+- **管线减负（2026-09-17 已装机）**：①`FixedDualContentHost` 触摸注入反射改为静态缓存（原每事件 2 次 getMethod，120Hz 输入流下的抖动源）；②`FixedDualSession.frame` 状态字符串从每帧拼接到 250ms 节流；③`FixedDualOutput.frame` 的 `feedback.cancel()` 改为仅在 blocked 跳变时调用（原每帧 invalidate 强逼 120Hz 遍历）。
+- **下一级方案（未做，需用户拍板）**：摊平状态绕过 GL 管线——createVirtualDisplay 直接吃 overlay 窗口 surface（或 SurfaceControl 直挂），折叠过渡才切回 GL；可再砍 1-2 帧延迟，但属于较大重构。
+
+## 微调：侧边返回水滴突起改黑底（2026-09-17）
+
+- `FixedDualGestureFeedback.onDraw` 里水滴填充色 `Color.rgb(92,94,98)`（灰）→ `Color.BLACK`，白箭头保持不变；仅此一处，`GestureNavigationOverlay` 的 EdgeView 是白色描边箭头、无填充底，未动。
+- 已离线重建 `projection-lab-debug.apk`（删旧包防假构建，17:56 新产物），待装机。
+
+## 翻页流畅度专题（2026-09-17 晚）
+
+- **用户校准**：只有翻页卡，下拉面板顺；且**非双屏模式也比原生卡** → 翻页瓶颈在页面绘制/合成成本，不在双屏传输层。
+- 实测（单屏模式、display 0 直测）：翻页中位帧耗 8ms、90 分位 13ms vs 120Hz 预算 8.3ms → 尾部掉帧；下拉面板中位仅 5ms（区域小）。
+- **已装机改动**：
+  1. `HomePager` 手势期间（DRAGGING/SETTLING）给页面开 `LAYER_TYPE_HARDWARE`，IDLE 释放（ViewPager 1.1.0 的 scrolling cache 已是空操作，此为等价物）；实测提升小（13→12ms），页面重录不是大头。
+  2. 双屏直连模式：`FixedDualGpu` 恒等参数 0.25s 后 `goDirect()`——销毁 EGL 窗口，经新增 AIDL `dualSurface`(=13) 让 `VirtualDisplay.setSurface` 直吃 TextureView，GL 线程转 50ms 轻量监视；折叠效应出现即 `leaveDirect()` 切回。切换竞态加固：`MobileHelper.dualSurface` 改同步 binder + EGL 重连一次重试（此前竞态曾致 Present failed 会话重启）。
+- **待用户手测**：①折叠/展开一次验证 direct↔shader 切换无黑闪（远程无法模拟铰链）；②翻页体感对比。
+- **下一候选（需用户拍板，涉及视觉取舍）**：翻页手势期间暂停 HomeGlass 每视图合成模糊（HyperOS `setBackgroundBlur`，SF 端每帧全窗计费，gfxinfo 看不到），IDLE 恢复——MiDuo/原生同款"手势中降特效"策略，代价是滑动瞬间玻璃变纯填充色。
+- 测量注意：装包后 `content=A,B` 的 id 又会变；双屏 running 时 display 0 是 overlay，`input -d 0` 打的是转发管线，别当单屏测。
+
+## 回滚（2026-09-17 晚，用户反馈"越来越卡"）
+
+- 用户反馈：比最初提刷新率问题时更卡。排查：direct 模式稳定无抖动（计数冻结）、Thermal 0、电池 37.3°C——非热降频、非切换抖动。
+- 判定：①120 解锁后内容帧（8-13ms）撑不稳 8.3ms 预算 → 节奏不均（8.3/16.6 交替）比原锁定 60 的稳定节奏更伤观感；②硬件层改动手势起手栅格化全屏两页 + 与每视图模糊冲突，疑似负优化。
+- **已回滚装机**：`HomePager` 硬件层（layerize 全撤）；`FixedDualContentHost` 的 min_refresh_rate=120 地板（保留 preferred mode 持有 + TextureView ALWAYS 投票 + 虚拟屏 120 模式 + 直连模式 + settle/20% 提交 + 三项减负）。
+- **教训**：帧率上限解锁前先确认内容帧预算能撑住，否则"不稳定的120"比"稳定的60"更卡；LAYER_TYPE_HARDWARE 与 HyperOS setBackgroundBlur 每视图模糊共存会负优化。
+- 待用户体感确认回滚版；若仍卡 → 两条路二选一：A. 手势期间降特效（模糊暂停等）真撑 120；B. 内容改回稳定 60（虚拟屏 setRequestedRefreshRate(60)），保节奏一致。
+
+## 翻页控件定位收口（2026-09-17 深夜）
+
+- 用户判断"翻页控件有问题"获数据确认：下拉面板也是跟手交互且顺（同一输入链路）→ 排除输入链路。A/B 实测（单屏 display 0）：**纯回弹动画帧稳定 8ms；跟手拖拽帧 5↔20ms 剧烈跳动（p90=20ms）** → 卡点在拖拽路径，且在"绘制前"段（抓到过单帧 PerformTraversalsStart→DrawStart 13.7ms，即布局/回调段），GPU 段 2-4ms 无辜。
+- 双屏 direct 模式下桌面帧反而 5-6ms 健康（虚拟屏 DuoSecondaryActivity 较轻？待复核）。
+- 硬件层无效的原因自洽：layers 不阻止 requestLayout/回调，只缓存绘制。
+- **下一步（新会话做，需干净上下文）**：Perfetto 抓一次拖拽（sched/input/view/binder tags）定位每帧 20ms 的具体回调；或二分法禁页面内容（先 widgets、再 FolderFan 预览、再文字阴影）对比拖拽帧。嫌疑清单：ViewPager 拖拽中触发的 populate/measure、DuoHomeActivity 80ms deliverCatalog 轮询链、AppWidgetHostView、文本 shadow。
+- 环境：双屏已恢复（pref=true、direct 模式 running）；单屏测试曾用 run-as 改 pref + force-stop + settings put 重绑无障碍（SharedPreferences 内存缓存，改文件必须重启进程）。
+- framestats 解析注意：HyperOS 输出列序与标准不同且时基混用（ns realtime + uptime），SwapBuffers 常为 -1（Vulkan）；逐段解析需先 dump 一行核对列义。

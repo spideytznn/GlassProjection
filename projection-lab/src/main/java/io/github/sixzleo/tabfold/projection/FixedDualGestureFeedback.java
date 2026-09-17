@@ -63,7 +63,7 @@ final class FixedDualGestureFeedback extends View {
             Path curve=new Path();curve.moveTo(-dp(2),cy-half);
             curve.cubicTo(0,cy-half*.48f,extent,cy-half*.48f,extent,cy);
             curve.cubicTo(extent,cy+half*.48f,0,cy+half*.48f,-dp(2),cy+half);curve.close();
-            paint.setStyle(Paint.Style.FILL);paint.setColor(Color.rgb(92,94,98));paint.setAlpha((int)(235*Math.min(1,progress*3)));canvas.drawPath(curve,paint);
+            paint.setStyle(Paint.Style.FILL);paint.setColor(Color.BLACK);paint.setAlpha((int)(235*Math.min(1,progress*3)));canvas.drawPath(curve,paint);
             float cx=extent*.52f,span=dp(5)*Math.min(1,progress*2);
             Path arrow=new Path();arrow.moveTo(cx+span*.5f,cy-span);arrow.lineTo(cx-span*.5f,cy);arrow.lineTo(cx+span*.5f,cy+span);
             paint.setColor(Color.WHITE);paint.setAlpha((int)(255*Math.min(1,progress*2)));paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(dp(2));paint.setStrokeCap(Paint.Cap.ROUND);paint.setStrokeJoin(Paint.Join.ROUND);canvas.drawPath(arrow,paint);canvas.restore();

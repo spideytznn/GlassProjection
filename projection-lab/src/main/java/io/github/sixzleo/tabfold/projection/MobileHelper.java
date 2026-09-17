@@ -84,6 +84,10 @@ final class MobileHelper {
         worker.execute(()->{try{if(current!=null)current.dualTouch(id,copy);}catch(Exception ignored){}finally{copy.recycle();}});
     }
     static void dualKey(int id,int key){IHelperHost current=host;worker.execute(()->{try{if(current!=null)current.dualKey(id,key);}catch(Exception ignored){}});}
+    /** Swaps a virtual display's output between the fold-shader input and its TextureView.
+     *  Synchronous on purpose: the caller re-attaches EGL only after the swap is applied. */
+    static void dualSurface(int id,android.view.Surface surface){IHelperHost current=host;
+        try{if(current!=null)current.dualSurface(id,surface);}catch(Exception ignored){}}
     /** Runs one restricted shell command on the helper; result is delivered on the main thread. */
     static void svc(String command,java.util.function.Consumer<String> result){
         IHelperHost current=host;

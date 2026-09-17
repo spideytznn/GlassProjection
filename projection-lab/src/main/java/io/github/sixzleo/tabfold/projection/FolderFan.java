@@ -11,4 +11,13 @@ final class FolderFan {
         int offset=(container-(2*icon+gap))/2;
         return new int[]{offset+(index%2)*(icon+gap),offset+(index/2)*(icon+gap)};
     }
+    /**
+     * MiDuo-style merge hot zone, in tile-local coordinates: horizontally centered on the
+     * tile, anchored to its top, wide/tall enough to cover most of the icon itself.
+     */
+    static boolean mergeZone(float x,float y,int tileWidth,int tileHeight,int iconPixels){
+        float zoneWidth=Math.min(tileWidth*0.82f,1.35f*iconPixels);
+        float zoneHeight=Math.min(tileHeight*0.78f,1.18f*iconPixels);
+        return Math.abs(x-tileWidth/2f)<=zoneWidth/2&&y<=zoneHeight;
+    }
 }

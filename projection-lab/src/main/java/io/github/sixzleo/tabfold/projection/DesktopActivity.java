@@ -50,6 +50,9 @@ public final class DesktopActivity extends Activity {
         int width=Math.min(getResources().getDisplayMetrics().widthPixels,dp(680));
         frame.addView(page,new FrameLayout.LayoutParams(width,-2,Gravity.TOP|Gravity.CENTER_HORIZONTAL));
         updates=UpdateCoordinator.get(this);
+        // Fixed dual is the only user-facing mode; legacy projection sections stay
+        // reachable only when dual was explicitly disabled through adb.
+        final boolean legacy=!FixedDualSession.enabled(this);
         LinearLayout top=new LinearLayout(this);top.setGravity(Gravity.CENTER_VERTICAL);page.addView(top);
         TextView mark=text("GLASS / FOLD",11,ACCENT);mark.setLetterSpacing(.18f);top.addView(mark,new LinearLayout.LayoutParams(0,-2,1));
         FrameLayout updateEntry=new FrameLayout(this);top.addView(updateEntry,new LinearLayout.LayoutParams(dp(112),dp(48)));
@@ -60,17 +63,17 @@ public final class DesktopActivity extends Activity {
         FrameLayout.LayoutParams dotLayout=new FrameLayout.LayoutParams(dp(8),dp(8),Gravity.TOP|Gravity.RIGHT);dotLayout.topMargin=dp(7);dotLayout.rightMargin=dp(5);updateEntry.addView(updateDot,dotLayout);updateDot.setVisibility(View.GONE);
         TextView title=text("玻璃投影",32,TEXT);title.setTypeface(null,Typeface.BOLD);title.setPadding(0,dp(9),0,dp(6));page.addView(title);
         page.addView(text("让每一次开合，柔和衔接。",14,MUTED));space(page,24);
-        LinearLayout status=card(page);state=text("动画已就绪",17,ACCENT);state.setTypeface(null,Typeface.BOLD);status.addView(state);
-        hint=text("在桌面或亮屏锁屏界面，展开或合拢手机即可体验。",13,MUTED);hint.setPadding(0,dp(7),0,dp(14));status.addView(hint);
-        section(page,"玻璃桌面 · 预览版","侧边 Dock、应用分页和手机现有小组件。可先预览，再选择是否设为默认桌面。");
-        button(card(page),"打开桌面预览",()->startActivity(new Intent(this,DuoHomeActivity.class)),true);
+        LinearLayout status=card(page);state=text("正在连接",17,ACCENT);state.setTypeface(null,Typeface.BOLD);status.addView(state);
+        hint=text("助手连接并开启无障碍后，固定双屏桌面自动运行。",13,MUTED);hint.setPadding(0,dp(7),0,dp(14));status.addView(hint);
+        section(page,"玻璃桌面 · 双屏版","侧边 Dock、应用分页和手机现有小组件。使用桌面需设为默认桌面并开启无障碍服务。");
+        button(card(page),"打开桌面",this::openDesktop,true);
         section(page,"① 连接手机端助手","首次配对一次，之后自动寻找本机并连接。不用填写 IP 和端口。");
         LinearLayout mobile=card(page);mobileStatus=text("",13,MUTED);mobile.addView(mobileStatus);
         button(mobile,"配对",this::pairWireless,true);
         mobile.addView(text("找不到开发者选项？"+DeveloperOptionsGuide.XIAOMI_PATH,12,MUTED));
         button(mobile,"如何开启开发者选项",()->DeveloperOptionsGuide.show(this),false);
         mobile.addView(text("默认打开配对小窗应用，在系统无线调试中打开配对码窗口，再回到小窗输入 6 位码。重启后若连接不上，请重新开启无线调试；一般无需再次配对。小米还需开启「USB 调试（安全设置）」。",12,MUTED));
-        section(page,"② 开启无障碍","助手连接成功后，再开启「玻璃投影」无障碍服务以显示动画。");
+        section(page,"② 开启无障碍","助手连接成功后，再开启「玻璃投影」无障碍服务，双屏桌面、状态栏和手势才能运行。");
         LinearLayout accessibility=card(page);
         service=button(accessibility,"开启无障碍",()->{
             if(!MobileHelper.ready()&&ProjectionService.instance==null){Toast.makeText(this,"请先完成第 1 步：连接手机端助手",Toast.LENGTH_SHORT).show();return;}
@@ -84,6 +87,7 @@ public final class DesktopActivity extends Activity {
         LinearLayout background=card(page);
         button(background,"后台运行设置",()->startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,android.net.Uri.parse("package:"+getPackageName()))),false);
         background.addView(text("退出设置页不会暂停动画，也不在最近任务中保留卡片。请允许后台自启动，并在小米后台设置中取消省电限制。",12,MUTED));
+        if(legacy){
         section(page,"作用范围","选择动画出现的位置，半折悬停时自动恢复正常画面。");
         LinearLayout scope=card(page);
         Switch global=new Switch(this);global.setText("全局启用");global.setTextColor(TEXT);global.setTextSize(16);
@@ -101,35 +105,71 @@ public final class DesktopActivity extends Activity {
         swipeRestore.setOnCheckedChangeListener((b,checked)->AnimationSettings.swipe(checked));
         restore.addView(swipeRestore,new LinearLayout.LayoutParams(-1,dp(60)));
         restore.addView(text("检测到手指滑动就立即回放，静态页面上也有效。轻点不触发，应用仍正常响应手势。",12,MUTED));
+        }
         section(page,"玻璃质感","调节雾化程度，保留原有的投影形状。");
         blur=slider(card(page),"模糊强度","100% 为当前默认效果；0% 关闭模糊。",0,200,5,AnimationSettings.blurPercent,"%",AnimationSettings::blur);
         section(page,"视差形变","拉伸与裁切同步调节，内外屏共用。");
         stretch=slider(card(page),"拉伸与裁切强度","默认 100%：偏转 30° 时裁切 12%。可调 0–125%；0% 关闭拉伸裁切。自动保存，调整立即生效。",0,ProjectionMath.MAX_STRETCH_PERCENT,5,AnimationSettings.stretchPercent,"%",AnimationSettings::stretch);
         section(page,"动画起点","调节接近合拢时的渐入角度，不改变切屏时机。");
         startAngle=slider(card(page),"动画起始角度","默认 1° · 可调 1–30°。超过设定角度后逐渐显现；合拢时反向淡出。完全合拢保护优先，实际起点受手机开合检测影响。",1,30,1,AnimationSettings.startAngle,"°",AnimationSettings::start);
+        if(legacy){
         section(page,"切屏时机","展开与合拢分别设置，角度越小越接近合上。");
         LinearLayout angles=card(page);
         open=slider(angles,"展开时切到内屏","默认 60° · 可调 10–170°",10,170,1,AnimationSettings.openAngle,"°",AnimationSettings::open);
         View line=new View(this);line.setBackgroundColor(0xff304044);LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,dp(1));lp.setMargins(0,dp(17),0,dp(20));angles.addView(line,lp);
         close=slider(angles,"合拢时切到外屏","默认 120° · 可调 10–170°",10,170,1,AnimationSettings.closeAngle,"°",AnimationSettings::close);
+        }
         space(page,12);button(page,"回到桌面体验",()->startActivity(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)),true);
         LinearLayout actions=new LinearLayout(this);actions.setOrientation(LinearLayout.HORIZONTAL);page.addView(actions);
-        Button reset=button(actions,"恢复默认",()->{AnimationSettings.reset();blur.setProgress(20);stretch.setProgress(ProjectionMath.DEFAULT_STRETCH_PERCENT/5);startAngle.setProgress(0);open.setProgress(50);close.setProgress(110);holdTime.setProgress(2);swipeRestore.setChecked(false);refreshStatus();Toast.makeText(this,"已恢复：模糊 100% · 拉伸裁切 100% · 起始 1° · 展开 60° · 合拢 120° · 悬停 3 秒",Toast.LENGTH_SHORT).show();},false);
+        Button reset=button(actions,"恢复默认",()->{AnimationSettings.reset();blur.setProgress(20);stretch.setProgress(ProjectionMath.DEFAULT_STRETCH_PERCENT/5);startAngle.setProgress(0);
+            if(open!=null)open.setProgress(50);if(close!=null)close.setProgress(110);if(holdTime!=null)holdTime.setProgress(2);if(swipeRestore!=null)swipeRestore.setChecked(false);
+            refreshStatus();Toast.makeText(this,"已恢复默认玻璃质感参数",Toast.LENGTH_SHORT).show();},false);
         reset.setLayoutParams(new LinearLayout.LayoutParams(0,dp(52),1));
-        Button pause=button(actions,"暂停动画",()->{ProjectionService.stop();refreshStatus();},false);pause.setLayoutParams(new LinearLayout.LayoutParams(0,dp(52),1));
+        Button pause=button(actions,"停用服务",()->{ProjectionService.stop();refreshStatus();},false);pause.setLayoutParams(new LinearLayout.LayoutParams(0,dp(52),1));
         TextView foot=text("设置自动保存，下次开合生效。",12,MUTED);foot.setGravity(Gravity.CENTER);foot.setPadding(0,dp(15),0,0);page.addView(foot);
         button(page,"无线连接开源许可",this::showNotices,false);
         button(page,"更多配对方式",this::alternativePairing,false);
         scroll.requestApplyInsets();refreshStatus();
     }
+    /** Desktop entry requires both preconditions: default home and the accessibility service. */
+    private void openDesktop(){
+        android.app.role.RoleManager roles=getSystemService(android.app.role.RoleManager.class);
+        if(roles==null||!roles.isRoleHeld(android.app.role.RoleManager.ROLE_HOME)){guideDefaultHome();return;}
+        if(ProjectionService.instance==null){
+            new AlertDialog.Builder(this).setTitle("需要开启无障碍")
+                .setMessage("玻璃桌面需要「玻璃投影」无障碍服务：用于双屏桌面、状态栏和手势。")
+                .setPositiveButton("去开启",(d,w)->AccessibilitySettings.open(this))
+                .setNegativeButton("取消",null).show();
+            return;
+        }
+        startActivity(new Intent(this,DuoHomeActivity.class));
+    }
+    private void guideDefaultHome(){
+        new AlertDialog.Builder(this).setTitle("需要设为默认桌面")
+            .setMessage("玻璃桌面以固定双屏方式运行，需要先将「玻璃投影」设为默认桌面。")
+            .setPositiveButton("去设置",(d,w)->{
+                try{
+                    android.app.role.RoleManager roles=getSystemService(android.app.role.RoleManager.class);
+                    if(roles!=null&&roles.isRoleAvailable(android.app.role.RoleManager.ROLE_HOME)&&!roles.isRoleHeld(android.app.role.RoleManager.ROLE_HOME))
+                        startActivityForResult(roles.createRequestRoleIntent(android.app.role.RoleManager.ROLE_HOME),4201);
+                    else startActivityForResult(new Intent(Settings.ACTION_HOME_SETTINGS),4201);
+                }catch(RuntimeException e){try{startActivity(new Intent(Settings.ACTION_HOME_SETTINGS));}catch(RuntimeException ignored){}}
+            })
+            .setNegativeButton("取消",null).show();
+    }
+    @Override protected void onActivityResult(int request,int result,Intent data){
+        super.onActivityResult(request,result,data);
+        if(request==4201)openDesktop();
+    }
     private void refreshStatus(){
         if(state==null)return;
+        boolean legacy=!FixedDualSession.enabled(this);
         if(blacklist!=null)blacklist.setText("应用黑名单 · 已选 "+AnimationSettings.blacklistedApps.size()+" 个");
         boolean enabled=ProjectionService.instance!=null;
         boolean ready=enabled&&MobileHelper.ready()&&SystemClock.uptimeMillis()-ProjectionService.helperAt<3000;
-        state.setText(ready?"●  动画已就绪":MobileHelper.ready()?enabled?"○  正在启动动画":"○  等待开启无障碍":"○  等待连接助手");
-        String scope=AnimationSettings.globalEnabled?"已全局启用。":"在桌面或亮屏锁屏界面，展开或合拢手机即可体验。";
-        hint.setText(ready?scope+"半折悬停 "+AnimationSettings.holdSeconds+" 秒后恢复正常画面。":MobileHelper.ready()?"助手已连接，请完成第 2 步：开启无障碍。":"请先完成第 1 步：连接手机端助手。");
+        state.setText(ready?(legacy?"●  动画已就绪":"●  双屏桌面已就绪"):MobileHelper.ready()?enabled?"○  正在启动双屏桌面":"○  等待开启无障碍":"○  等待连接助手");
+        String scope=legacy?AnimationSettings.globalEnabled?"已全局启用。":"在桌面或亮屏锁屏界面，展开或合拢手机即可体验。":"设为默认桌面后，两块屏幕常驻玻璃桌面，开合时画面柔和过渡。";
+        hint.setText(ready?scope+(legacy?"半折悬停 "+AnimationSettings.holdSeconds+" 秒后恢复正常画面。":""):MobileHelper.ready()?"助手已连接，请完成第 2 步：开启无障碍。":"请先完成第 1 步：连接手机端助手。");
         if(mobileStatus!=null)mobileStatus.setText(MobileHelper.message);
         service.setText(enabled?"管理无障碍服务":MobileHelper.ready()?"开启无障碍":"先连接助手，再开启无障碍");
         service.setAlpha(enabled||MobileHelper.ready()?1:.5f);

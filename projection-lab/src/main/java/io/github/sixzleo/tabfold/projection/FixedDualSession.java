@@ -19,13 +19,23 @@ final class FixedDualSession {
     private int touchedDisplay=-1;
     void touched(int id){touchedDisplay=id;}
     static void nativeHomeRequested(){if(current!=null&&current.touchedDisplay>=0)MobileHelper.dualKey(current.touchedDisplay,KeyEvent.KEYCODE_HOME);}
-    private long readyUntil,lastFrame;
+    private long readyUntil,lastFrame,statusAt;
     private float angle=Float.NaN;
     private static long nextStart;
     static boolean active(){return current!=null;}
-    static boolean enabled(android.content.Context c){return c.getSharedPreferences("duo_dual",0).getBoolean("enabled",false);}
+    /** Display ids of this session's live content surfaces; empty while starting or after close. */
+    static Set<Integer> activeContentIds(){
+        FixedDualSession s=current;
+        if(s==null)return Collections.emptySet();
+        Set<Integer> ids=new HashSet<>();
+        for(FixedDualOutput o:s.outputs)if(o.contentId>=0)ids.add(o.contentId);
+        return ids;
+    }
+    /** Fixed dual is the one advertised desktop mode; the legacy single-screen pipeline stays dormant unless disabled via adb. */
+    static boolean enabled(android.content.Context c){return c.getSharedPreferences("duo_dual",0).getBoolean("enabled",true);}
     static void setEnabled(android.content.Context c,boolean enabled){c.getSharedPreferences("duo_dual",0).edit().putBoolean("enabled",enabled).apply();if(enabled)start(ProjectionService.instance);else stop();}
     static void maintain(ProjectionService service){
+        DuoHomeActivity.validateSecondaryHomes();
         boolean ownHome=service.getSystemService(android.app.role.RoleManager.class).isRoleHeld(android.app.role.RoleManager.ROLE_HOME);
         if(!ownHome){stop();return;}
         if(active()||!enabled(service)||!MobileHelper.ready()||SystemClock.uptimeMillis()<nextStart)return;
@@ -56,13 +66,40 @@ final class FixedDualSession {
         if(closed)return;
         try{
             DisplayManager dm=service.getSystemService(DisplayManager.class);
+            Display innerDisplay=null,coverDisplay=null;
             for(Display display:dm.getDisplays()){
-                String id=identity(display);boolean inner=id.equals("local:4639175402683733248");
-                if(!inner&&!id.equals("local:4639175068132267009"))continue;
-                if(outputs.stream().noneMatch(o->o.inner==inner))outputs.add(new FixedDualOutput(service,display,inner,this));
+                String id=identity(display);
+                if(id.equals("local:4639175402683733248"))innerDisplay=display;
+                else if(id.equals("local:4639175068132267009"))coverDisplay=display;
             }
+            if(innerDisplay!=null&&outputs.stream().noneMatch(o->o.inner))
+                outputs.add(new FixedDualOutput(service,innerDisplay,true,0,this));
+            if(coverDisplay!=null&&outputs.stream().noneMatch(o->!o.inner))
+                outputs.add(new FixedDualOutput(service,coverDisplay,false,compensatedDensity(innerDisplay,coverDisplay),this));
             if(outputs.size()<2){if(SystemClock.uptimeMillis()>readyUntil)throw new IllegalStateException("Missing physical panel");main.postDelayed(this::prepare,50);}
         }catch(Exception e){fail(e.toString());}
+    }
+    /**
+     * Both panels report the same nominal densityDpi while their real PPI differs, so one dp
+     * renders at a different physical size per screen. Anchor to the inner panel and scale
+     * the cover density by the PPI ratio for exact physical parity. This ROM normalizes the
+     * app-visible xdpi to densityDpi, so the lhasa panel PPIs (from the display viewports)
+     * are used when the metrics cannot tell the panels apart.
+     */
+    static volatile String densityInfo="";
+    private static int compensatedDensity(Display innerDisplay,Display coverDisplay){
+        try{
+            if(innerDisplay==null||coverDisplay==null)return 0;
+            android.util.DisplayMetrics innerMetrics=new android.util.DisplayMetrics();innerDisplay.getRealMetrics(innerMetrics);
+            android.util.DisplayMetrics coverMetrics=new android.util.DisplayMetrics();coverDisplay.getRealMetrics(coverMetrics);
+            if(innerMetrics.xdpi<=0||coverMetrics.xdpi<=0)return 0;
+            float ratio=coverMetrics.xdpi/innerMetrics.xdpi;
+            if(Math.abs(ratio-1f)<0.002f&&"lhasa".equals(android.os.Build.DEVICE))
+                ratio=385.288f/381.913f; // cover PPI / inner PPI, measured from the viewports
+            int base=coverMetrics.densityDpi,compensated=Math.round(base*ratio);
+            densityInfo="metrics xdpi="+(int)innerMetrics.xdpi+"/"+(int)coverMetrics.xdpi+" ratio="+String.format(java.util.Locale.ROOT,"%.4f",ratio)+" -> "+compensated;
+            return compensated>=100&&compensated<=800&&compensated!=base?compensated:0;
+        }catch(Exception e){return 0;}
     }
     void contentReady(){if(closed)return;if(outputs.size()==2&&outputs.stream().allMatch(o->o.contentId>=0)){status="running";Choreographer.getInstance().postFrameCallback(frame);}}
     private final Choreographer.FrameCallback frame=new Choreographer.FrameCallback(){public void doFrame(long nanos){
@@ -81,7 +118,8 @@ final class FixedDualSession {
             angle=contact?0:flat?180:ProjectionMath.followAngle(angle,target,lastFrame==0?16:now-lastFrame);lastFrame=now;
             FixedDualPolicy.Panel visible=policy.update(flat,contact,Float.isFinite(raw)&&pose.directContactStatus>=0,!asleep);
             for(FixedDualOutput output:outputs)output.frame(angle,visible==FixedDualPolicy.Panel.NONE||visible==FixedDualPolicy.Panel.INNER&&!output.inner||visible==FixedDualPolicy.Panel.COVER&&output.inner);
-            status="running primary="+primary+" visible="+visible+" angle="+raw+" content="+outputs.get(0).contentId+","+outputs.get(1).contentId;
+            if(now-statusAt>=250){statusAt=now;status="running primary="+primary+" visible="+visible+" angle="+raw+" content="+outputs.get(0).contentId+","+outputs.get(1).contentId
+                +" dpi="+outputs.get(0).density+"/"+outputs.get(1).density+" "+densityInfo;}
             Choreographer.getInstance().postFrameCallback(this);
         }catch(Exception e){fail(e.toString());}
     }};
@@ -89,6 +127,7 @@ final class FixedDualSession {
     private void close(){
         if(closed)return;closed=true;main.removeCallbacksAndMessages(null);Choreographer.getInstance().removeFrameCallback(frame);
         for(FixedDualOutput output:outputs)output.close();outputs.clear();
+        DuoHomeActivity.validateSecondaryHomes();
         MobileHelper.fixedDualState(-1,result->{if(current==this)current=null;if(!status.startsWith("ERROR"))status="stopped; "+result;});
     }
 }

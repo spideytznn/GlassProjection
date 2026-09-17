@@ -24,27 +24,64 @@ final class HomeSheet extends Dialog {
     private final int preferredWidth,preferredHeight;
     private LinearLayout heading;
     private boolean keyboardVisible;
-    HomeSheet(Activity activity,int widthDp,int heightDp){
+    private final boolean bottom;
+    private final boolean fullscreen;
+    HomeSheet(Activity activity,int widthDp,int heightDp){this(activity,widthDp,heightDp,false,false);}
+    HomeSheet(Activity activity,int widthDp,int heightDp,boolean bottom){this(activity,widthDp,heightDp,bottom,false);}
+    /** Bottom variant rises from the bottom edge; fullscreen variant fills the window with borderless glass. */
+    HomeSheet(Activity activity,int widthDp,int heightDp,boolean bottom,boolean fullscreen){
         super(activity,R.style.HomeSheetTheme);
+        this.bottom=bottom;this.fullscreen=fullscreen;
+        // Kill the theme's square dim panel: the rounded glass card must float free.
+        getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
         preferredWidth=dp(widthDp);preferredHeight=dp(heightDp);
         outside=new FrameLayout(activity);outside.setTag("home-sheet-outside");outside.setOnClickListener(v->dismiss());
         outside.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         content=new LinearLayout(activity);content.setTag("home-sheet-content");content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(20),dp(12),dp(20),dp(16));content.setClickable(true);
-        content.setBackground(HomeStyle.surface(content,0xee252b32,HomeStyle.PANEL_RADIUS));
-        HomeGlass.apply(content,dp(32),dp(28));
-        outside.addView(content,new FrameLayout.LayoutParams(preferredWidth,preferredHeight,Gravity.CENTER));
+        content.setPadding(dp(fullscreen?28:20),dp(12),dp(fullscreen?28:20),dp(16));
+        // Fullscreen blur covers the whole window, so "tap outside" can only be a tap on the
+        // content itself; child views (icons, buttons) still consume their own taps.
+        content.setOnClickListener(fullscreen?v->dismiss():null);
+        if(fullscreen){
+            content.setBackground(null);
+            HomeStyle.glass(content,0,HomeStyle.ROLE_SCREEN,false);
+            outside.addView(content,new FrameLayout.LayoutParams(-1,-1));
+        }else{
+            HomeStyle.glass(content,HomeStyle.PANEL_RADIUS,HomeStyle.ROLE_CARD);
+            FrameLayout stage=new FrameLayout(activity);
+            stage.addView(content,new FrameLayout.LayoutParams(preferredWidth,preferredHeight,
+                bottom?Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL:Gravity.CENTER));
+            outside.addView(stage,new FrameLayout.LayoutParams(-1,-1));
+        }
         scrim=new View(activity);scrim.setBackgroundColor(0x52000000);
         scrim.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         outside.addView(scrim,0,new FrameLayout.LayoutParams(-1,-1));
         setContentView(outside);
         Window window=getWindow();window.setDecorFitsSystemWindows(false);
+        // Force a truly fullscreen window: MIUI otherwise shrinks dialog windows to their
+        // content bounds, which exposes a square dim/limit frame around the rounded card.
+        WindowManager.LayoutParams windowParams=window.getAttributes();
+        windowParams.setFitInsetsTypes(0);
+        windowParams.flags|=WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+        window.setAttributes(windowParams);
         window.setStatusBarColor(Color.TRANSPARENT);window.setNavigationBarColor(Color.TRANSPARENT);
-        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING|WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+            |(bottom?WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE:WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN));
         outside.setOnApplyWindowInsetsListener((v,insets)->{
             keyboardVisible=insets.isVisible(WindowInsets.Type.ime());
             Insets safe=insets.getInsets(WindowInsets.Type.systemBars()|WindowInsets.Type.displayCutout()|WindowInsets.Type.ime());
-            outside.setPadding(safe.left+dp(16),safe.top+dp(12),safe.right+dp(16),safe.bottom+dp(12));
+            if(fullscreen){
+                // The blur base must cover the whole window: keep system-bar clearance INSIDE
+                // the blurred surface instead of as container padding, which would leave an
+                // unblurred wallpaper frame around the panel.
+                content.setPadding(dp(28),safe.top+dp(12),dp(28),Math.max(safe.bottom,dp(16)));
+            }else{
+                // Margins (not container padding): the window stays fullscreen so the dim and
+                // blur reach every edge, and only the card itself is inset.
+                FrameLayout.LayoutParams card=(FrameLayout.LayoutParams)content.getLayoutParams();
+                card.setMargins(safe.left+dp(16),safe.top+dp(12),safe.right+dp(16),safe.bottom+dp(12));
+                content.setLayoutParams(card);
+            }
             resize();return insets;
         });
         outside.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->resize());
@@ -69,8 +106,10 @@ final class HomeSheet extends Dialog {
     }
     private int dp(int value){return Math.round(value*getContext().getResources().getDisplayMetrics().density);}
     private void resize(){
-        int availableWidth=outside.getWidth()-outside.getPaddingLeft()-outside.getPaddingRight();
-        int availableHeight=outside.getHeight()-outside.getPaddingTop()-outside.getPaddingBottom();
+        if(fullscreen)return;
+        FrameLayout.LayoutParams card=(FrameLayout.LayoutParams)content.getLayoutParams();
+        int availableWidth=outside.getWidth()-outside.getPaddingLeft()-outside.getPaddingRight()-card.leftMargin-card.rightMargin;
+        int availableHeight=outside.getHeight()-outside.getPaddingTop()-outside.getPaddingBottom()-card.topMargin-card.bottomMargin;
         if(availableWidth<=0||availableHeight<=0)return;
         if(heading!=null){int visibility=keyboardVisible&&availableHeight<dp(320)?View.GONE:View.VISIBLE;
             if(heading.getVisibility()!=visibility)heading.setVisibility(visibility);}

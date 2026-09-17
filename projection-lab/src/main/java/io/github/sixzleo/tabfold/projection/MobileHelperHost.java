@@ -134,6 +134,11 @@ public final class MobileHelperHost extends IHelperHost.Stub {
         try{if(dualContent!=null)dualContent.key(displayId,keyCode);}catch(Exception e){android.util.Log.e("DuoFixed","Key failed",e);}
         finally{Binder.restoreCallingIdentity(token);}
     }
+    @Override public synchronized void dualSurface(int displayId,android.view.Surface surface){
+        caller();long token=Binder.clearCallingIdentity();
+        try{if(dualContent!=null)dualContent.surface(displayId,surface);}catch(Exception e){android.util.Log.e("DuoFixed","Surface swap failed",e);}
+        finally{Binder.restoreCallingIdentity(token);}
+    }
     @Override public synchronized String status(){caller();return "uid="+android.os.Process.myUid()+" requested="+running+" renderer="+(renderer!=null&&renderer.isAlive())+" controller="+(controller!=null&&controller.isAlive());}
     @Override public synchronized boolean observeTouch(IBinder binder,boolean enabled){
         caller();if(Build.VERSION.SDK_INT<34)return false;

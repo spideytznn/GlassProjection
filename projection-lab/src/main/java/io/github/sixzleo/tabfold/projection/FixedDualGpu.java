@@ -22,15 +22,21 @@ final class FixedDualGpu implements AutoCloseable {
     private final ProjectionAngleMotion motion=new ProjectionAngleMotion();
     private final ProjectionEntrance entrance=new ProjectionEntrance();
     private long started;
-    FixedDualGpu(Surface output,int width,int height,boolean inner,java.util.function.Consumer<Surface> ready,java.util.function.Consumer<String> failed){
-        this.width=width;this.height=height;this.inner=inner;this.failed=failed;thread.start();worker=new Handler(thread.getLooper());
+    private final Surface output;
+    private final java.util.function.BiConsumer<Boolean,Surface> swap;
+    private EGLConfig config;
+    private boolean direct;
+    private int identityFrames;
+    FixedDualGpu(Surface output,int width,int height,boolean inner,java.util.function.Consumer<Surface> ready,java.util.function.Consumer<String> failed,java.util.function.BiConsumer<Boolean,Surface> swap){
+        this.width=width;this.height=height;this.inner=inner;this.failed=failed;this.output=output;this.swap=swap;thread.start();worker=new Handler(thread.getLooper());
         worker.post(()->{try{init(output);main.post(()->{if(!closed)ready.accept(input);});worker.post(draw);}catch(Exception e){error(e);}});
     }
     private void init(Surface output){
         display=EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);int[] version=new int[2];
         if(!EGL14.eglInitialize(display,version,0,version,1))throw new IllegalStateException("eglInitialize");
         EGLConfig[] configs=new EGLConfig[1];int[] count=new int[1];
-        EGL14.eglChooseConfig(display,new int[]{EGL14.EGL_RENDERABLE_TYPE,EGL14.EGL_OPENGL_ES2_BIT,EGL14.EGL_SURFACE_TYPE,EGL14.EGL_WINDOW_BIT,EGL14.EGL_RED_SIZE,8,EGL14.EGL_GREEN_SIZE,8,EGL14.EGL_BLUE_SIZE,8,EGL14.EGL_ALPHA_SIZE,8,EGL14.EGL_NONE},0,configs,0,1,count,0);
+        if(!EGL14.eglChooseConfig(display,new int[]{EGL14.EGL_RENDERABLE_TYPE,EGL14.EGL_OPENGL_ES2_BIT,EGL14.EGL_SURFACE_TYPE,EGL14.EGL_WINDOW_BIT,EGL14.EGL_RED_SIZE,8,EGL14.EGL_GREEN_SIZE,8,EGL14.EGL_BLUE_SIZE,8,EGL14.EGL_ALPHA_SIZE,8,EGL14.EGL_NONE},0,configs,0,1,count,0))throw new IllegalStateException("eglChooseConfig");
+        config=configs[0];
         context=EGL14.eglCreateContext(display,configs[0],EGL14.EGL_NO_CONTEXT,new int[]{EGL14.EGL_CONTEXT_CLIENT_VERSION,2,EGL14.EGL_NONE},0);
         window=EGL14.eglCreateWindowSurface(display,configs[0],output,new int[]{EGL14.EGL_NONE},0);
         if(!EGL14.eglMakeCurrent(display,window,window,context))throw new IllegalStateException("eglMakeCurrent");
@@ -39,6 +45,7 @@ final class FixedDualGpu implements AutoCloseable {
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MIN_FILTER,GLES20.GL_LINEAR);GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MAG_FILTER,GLES20.GL_LINEAR);
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_S,GLES20.GL_CLAMP_TO_EDGE);GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_T,GLES20.GL_CLAMP_TO_EDGE);
         source=new SurfaceTexture(external);source.setDefaultBufferSize(width,height);source.setOnFrameAvailableListener(s->dirty=true,worker);input=new Surface(source);
+        input.setFrameRate(120,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
         FloatBuffer vertices=ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder()).asFloatBuffer();vertices.put(new float[]{-1,-1,1,-1,-1,1,1,1}).position(0);
         pyramid=new FixedDualGpuPyramid(Math.max(width,height)/2,vertices);
         GLES20.glUseProgram(program);uniform("canvasSize",0);uniform("spillFraction",ProjectionMath.INNER_SPILL_FRACTION);uniform("hingeDistanceFraction",ProjectionMath.OUTER_HINGE_DISTANCE_FRACTION);
@@ -50,18 +57,23 @@ final class FixedDualGpu implements AutoCloseable {
     private final Runnable draw=new Runnable(){public void run(){
         if(closed)return;
         try{
+            long now=SystemClock.uptimeMillis();FoldPose pose=ProjectionService.foldPose.expireDirectContact(SystemClock.elapsedRealtimeNanos());
+            boolean blocked=ProjectionAngleMotion.hardBlocked(pose.blocksProjection(),pose.fullyOpened(),inner);
+            float eased=motion.update(now,pose.angle(),inner,pose.blocksProjection(),pose.fullyOpened(),false);
+            float endpoint=ProjectionMath.endpointOpacity(eased,inner,AnimationSettings.startAngle,blocked);
+            boolean visible=ProjectionMath.endpointOpacity(inner?eased:pose.angle(),inner,AnimationSettings.startAngle,blocked)>0;
+            float entry=entrance.update(now,visible,false,started,inner?180:80);
+            float amount=ProjectionMath.onsetMotion(endpoint,entry);
+            float tilt=ProjectionMath.effectTilt(eased,inner,AnimationSettings.startAngle,blocked)*amount;
+            float crop=ProjectionMath.cropFraction(eased,inner,AnimationSettings.stretchPercent)*amount;
+            if(direct){
+                // Only a developing fold effect needs the shader; watch cheaply while bypassed.
+                if(tilt!=0f||crop!=0f)leaveDirect();
+                worker.postDelayed(this,50);return;
+            }
             boolean changed=dirty;dirty=false;
             if(changed){GLES20.glActiveTexture(GLES20.GL_TEXTURE7);source.updateTexImage();source.getTransformMatrix(matrix);hasFrame=true;pyramidDirty=true;sourceFrames++;}
             if(hasFrame){
-                long now=SystemClock.uptimeMillis();FoldPose pose=ProjectionService.foldPose.expireDirectContact(SystemClock.elapsedRealtimeNanos());
-                boolean blocked=ProjectionAngleMotion.hardBlocked(pose.blocksProjection(),pose.fullyOpened(),inner);
-                float eased=motion.update(now,pose.angle(),inner,pose.blocksProjection(),pose.fullyOpened(),false);
-                float endpoint=ProjectionMath.endpointOpacity(eased,inner,AnimationSettings.startAngle,blocked);
-                boolean visible=ProjectionMath.endpointOpacity(inner?eased:pose.angle(),inner,AnimationSettings.startAngle,blocked)>0;
-                float entry=entrance.update(now,visible,false,started,inner?180:80);
-                float amount=ProjectionMath.onsetMotion(endpoint,entry);
-                float tilt=ProjectionMath.effectTilt(eased,inner,AnimationSettings.startAngle,blocked)*amount;
-                float crop=ProjectionMath.cropFraction(eased,inner,AnimationSettings.stretchPercent)*amount;
                 float opacity=ProjectionMath.onsetOpacity(endpoint),strength=AnimationSettings.blurPercent/100f;
                 // The shader samples only nativeSource when opacity is below .001,
                 // tilt is zero, or blurStrength is zero. Keep the old pyramid dirty:
@@ -81,9 +93,35 @@ final class FixedDualGpu implements AutoCloseable {
                 }
                 if(now-statsAt>=1000){statsAt=now;String stats="source="+sourceFrames+" pyramid="+pyramidUpdates+" presented="+presentedFrames+" tilt="+tilt+" needsBlur="+needsPyramid;if(inner)innerStats=stats;else coverStats=stats;}
             }
-            worker.postDelayed(this,8);
+            // Steady identity means the shader is a plain copy; hand the TextureView straight
+            // to the virtual display until a fold effect develops again.
+            if(tilt==0f&&crop==0f){if(++identityFrames>=64)goDirect();}
+            else identityFrames=0;
+            // Sample faster than the 8.3ms cadence of a 120Hz source, or adjacent frames merge.
+            worker.postDelayed(this,4);
         }catch(Exception e){error(e);}
     }};
+    /** Bypasses the shader: release the TextureView's producer to the virtual display and idle. */
+    private void goDirect(){
+        direct=true;identityFrames=0;
+        if(window!=EGL14.EGL_NO_SURFACE){EGL14.eglMakeCurrent(display,EGL14.EGL_NO_SURFACE,EGL14.EGL_NO_SURFACE,EGL14.EGL_NO_CONTEXT);EGL14.eglDestroySurface(display,window);window=EGL14.EGL_NO_SURFACE;}
+        swap.accept(true,output);
+        String stats="direct presented="+presentedFrames;if(inner)innerStats=stats;else coverStats=stats;
+    }
+    private void leaveDirect(){
+        direct=false;
+        swap.accept(false,input);
+        // The virtual display must release the TextureView's queue before EGL re-attaches;
+        // one retry guards the residual race on slow binder round trips.
+        for(int attempt=0;attempt<2;attempt++){
+            window=EGL14.eglCreateWindowSurface(display,config,output,new int[]{EGL14.EGL_NONE},0);
+            if(window!=EGL14.EGL_NO_SURFACE&&EGL14.eglMakeCurrent(display,window,window,context))break;
+            window=EGL14.EGL_NO_SURFACE;
+            if(attempt==1)throw new IllegalStateException("eglMakeCurrent");
+            SystemClock.sleep(30);
+        }
+        hasFrame=false;pyramidDirty=true;lastTilt=Float.NaN;statsAt=0;
+    }
     private void error(Exception e){android.util.Log.e("DuoFixed","Original fold renderer",e);main.post(()->failed.accept(e.toString()));close();}
     @Override public void close(){if(closed)return;closed=true;worker.removeCallbacksAndMessages(null);worker.post(()->{
         if(input!=null)input.release();if(source!=null)source.release();if(pyramid!=null)pyramid.close();

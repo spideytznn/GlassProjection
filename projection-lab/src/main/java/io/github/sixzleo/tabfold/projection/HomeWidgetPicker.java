@@ -62,8 +62,8 @@ final class HomeWidgetPicker {
                 row.icon.setImageBitmap(entry.icon.bitmap);requestIcon(entry.icon);row.title.setText(entry.title);
                 row.application.setText(entry.application+(entry.provider.getProfile().equals(android.os.Process.myUserHandle())?"":" · 工作资料"));
                 float density=activity.getResources().getDisplayMetrics().density;
-                int spanX=HomeWidgets.defaultSpan(entry.provider.targetCellWidth,entry.provider.minWidth,80*density,4*density);
-                int spanY=HomeWidgets.defaultSpan(entry.provider.targetCellHeight,entry.provider.minHeight,96*density,4*density);
+                int spanX=HomeWidgets.defaultSpan(entry.provider.targetCellWidth,entry.provider.minWidth,80*density,4*density,HomeLayout.COLUMNS);
+                int spanY=HomeWidgets.defaultSpan(entry.provider.targetCellHeight,entry.provider.minHeight,96*density,4*density,HomeLayout.ROWS);
                 row.size.setText(spanX+"×"+spanY);return row;
             }
         };

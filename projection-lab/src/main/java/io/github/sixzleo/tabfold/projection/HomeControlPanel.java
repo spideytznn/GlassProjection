@@ -65,7 +65,7 @@ import java.util.function.Consumer;
 final class HomeControlPanel {
     // Glass materials: dock-tinted translucency with a bottom fade instead of a solid edge.
     private static final int TEXT=0xfff2f2f7, MUTED=0x99ebebf5, BLUE=0xff0a84ff;
-    private static final int PANEL_TINT=0x8c343b43, MODULE=0x42787880, CARD=0x463a3a44;
+    private static final int PANEL_TINT=0xff121b1f, MODULE=0x42787880, CARD=0x463a3a44;
     private static final int TORCH_ON=0xfff2f2f7, TORCH_GLYPH=0xff16161c, INDIGO=0xff5e5ce6;
     private static final Typeface MEDIUM=Typeface.create("sans-serif-medium",Typeface.NORMAL);
 
@@ -104,7 +104,10 @@ final class HomeControlPanel {
     private boolean batteryCharging;
     private CameraManager torchManager;
     private String torchId;
-    private boolean torchOn,closed,attached;
+    private boolean torchOn,closed,attached,fingerDriven;
+    private float dropDistance;
+    private float handleTouchX,handleTouchY;
+    private android.animation.ValueAnimator dragAnim;
 
     private final CameraManager.TorchCallback torchCallback=new CameraManager.TorchCallback(){
         @Override public void onTorchModeChanged(String id,boolean enabled){torchOn=enabled;main.post(()->{if(!closed&&control)paintTiles();});}
@@ -117,11 +120,31 @@ final class HomeControlPanel {
         if(showing!=null&&showing.attached){showing.switchTo(control);return;}
         android.view.Display target=s.getSystemService(android.hardware.display.DisplayManager.class).getDisplay(displayId);
         if(target==null)return;
-        HomeControlPanel created=new HomeControlPanel(s,target,control);
+        HomeControlPanel created=new HomeControlPanel(s,target,control,false,0f);
         if(created.attached)currentByDisplay.put(displayId,created);
     }
+    /** Shade pinned to the finger: built at the touch position, then driven by dragOn/releaseOn. */
+    static void beginDrag(int displayId,boolean control,float fingerY){
+        ProjectionService s=ProjectionService.instance;if(s==null)return;
+        HomeControlPanel showing=currentByDisplay.get(displayId);
+        if(showing!=null&&showing.attached){showing.switchTo(control);return;}
+        android.view.Display target=s.getSystemService(android.hardware.display.DisplayManager.class).getDisplay(displayId);
+        if(target==null)return;
+        HomeControlPanel created=new HomeControlPanel(s,target,control,true,fingerY);
+        if(created.attached)currentByDisplay.put(displayId,created);
+    }
+    /** Finger tracking while a pull gesture owns the shade; fingerY is the touch's screen y. */
+    static void dragOn(int displayId,float fingerY){
+        HomeControlPanel panel=currentByDisplay.get(displayId);
+        if(panel!=null)panel.dragTo(fingerY);
+    }
+    /** Release the finger tracking; velocity in px/ms (down positive) decides settle vs spring shut. */
+    static void releaseOn(int displayId,float velocityPxMs){
+        HomeControlPanel panel=currentByDisplay.get(displayId);
+        if(panel!=null)panel.releaseDrag(velocityPxMs);
+    }
 
-    private HomeControlPanel(ProjectionService service,android.view.Display display,boolean control){
+    private HomeControlPanel(ProjectionService service,android.view.Display display,boolean control,boolean interactive,float fingerY){
         this.service=service;this.display=display;this.control=control;
         Context wc=service.createDisplayContext(display)
             .createWindowContext(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,null);
@@ -138,10 +161,17 @@ final class HomeControlPanel {
         scrim.setOnClickListener(v->close());
         panel=new LinearLayout(wc);panel.setOrientation(LinearLayout.VERTICAL);
         // Full-bleed glass like the dock, melting into the wallpaper at the bottom edge.
-        panel.setBackground(new GlassFade(PANEL_TINT,dp(110)));
+        // MiDuo Screen role: heavy blur with a light fill, solid dark fallback when blur is off.
+        // Start at the blur fill, not the fallback: the async blur listener would otherwise
+        // show a near-black panel for its first few frames of the drop-in (the "shade flash").
+        // Blur engages here a few frames later as a soft sharpen-to-frost; if this ROM ever
+        // reports blur off, the listener deepens the fill to the fallback.
+        GlassFade fadeDrawable=new GlassFade(PANEL_TINT,dp(110));
+        fadeDrawable.setAlpha(Math.round(HomeStyle.ROLE_SCREEN[1]*255));
+        panel.setBackground(fadeDrawable);
         panel.setPadding(dp(18),dp(8),dp(18),dp(14));
         panel.setClickable(true);
-        HomeGlass.apply(panel,dp(32),0);
+        HomeGlass.apply(panel,dp(28),0,fadeDrawable,Math.round(HomeStyle.ROLE_SCREEN[1]*255),Math.round(HomeStyle.ROLE_SCREEN[2]*255));
         controlPane=new LinearLayout(wc);controlPane.setOrientation(LinearLayout.VERTICAL);
         controlPane.setOnClickListener(v->close());
         notifPane=new LinearLayout(wc);notifPane.setOrientation(LinearLayout.VERTICAL);
@@ -150,6 +180,22 @@ final class HomeControlPanel {
         paneHost.addView(notifPane,new FrameLayout.LayoutParams(-1,-1));
         paneHost.addView(controlPane,new FrameLayout.LayoutParams(-1,-1));
         panel.addView(paneHost,new LinearLayout.LayoutParams(-1,0,1f));
+        // Close handle over the bottom gradient whitespace. On the inner screen the
+        // content is rotated 90°, so a physical upward swipe arrives as a sideways
+        // drag that PaneHost would read as page switching; this handle closes on any
+        // direction so the natural "flick the sheet away" gesture always wins.
+        View handle=new View(wc);
+        handle.setOnTouchListener((v,event)->{
+            switch(event.getActionMasked()){
+                case MotionEvent.ACTION_DOWN:handleTouchX=event.getX();handleTouchY=event.getY();return true;
+                case MotionEvent.ACTION_MOVE:
+                    if(Math.abs(event.getX()-handleTouchX)>dp(10)||Math.abs(event.getY()-handleTouchY)>dp(10)){close();return true;}
+                    handleTouchX=event.getX();handleTouchY=event.getY();return true;
+                case MotionEvent.ACTION_UP:close();return true;
+                default:return true;
+            }
+        });
+        panel.addView(handle,new LinearLayout.LayoutParams(-1,dp(52)));
         root=new FrameLayout(wc);
         root.setOnClickListener(v->close());
         root.addView(scrim,new FrameLayout.LayoutParams(-1,-1));
@@ -174,8 +220,19 @@ final class HomeControlPanel {
         settle(control);
         try{service.registerReceiver(batteryReceiver,new IntentFilter(Intent.ACTION_BATTERY_CHANGED));}catch(RuntimeException ignored){}
 
-        float drop=service.getResources().getDisplayMetrics().heightPixels*0.6f;
-        panel.setTranslationY(-drop);scrim.setAlpha(0f);
+        dropDistance=service.getResources().getDisplayMetrics().heightPixels*0.6f;
+        panel.setTranslationY(-dropDistance);scrim.setAlpha(0f);
+        if(interactive){
+            // Bottom-edge tracking, like the native shade: the sheet stays glued to the
+            // screen top and its height rides the finger 1:1. Resizing (not clipping —
+            // the compositor blur is a window-level drawable that ignores clipBounds)
+            // keeps the frost exactly above the fingertip, and the GlassFade gradient
+            // lands right on the reveal edge.
+            fingerDriven=true;
+            panel.setTranslationY(0f);
+            dragTo(fingerY);
+            return;
+        }
         if(!android.animation.ValueAnimator.areAnimatorsEnabled()){
             panel.setTranslationY(0f);scrim.setAlpha(1f);return;
         }
@@ -183,15 +240,66 @@ final class HomeControlPanel {
         panel.animate().translationY(0f).setDuration(340)
             .setInterpolator(new PathInterpolator(.32f,.72f,0f,1f)).start();
     }
+    void dragTo(float fingerY){
+        if(closed||!attached||!fingerDriven)return;
+        if(dragAnim!=null)dragAnim.cancel();
+        panel.animate().cancel();scrim.animate().cancel();
+        int full=root.getHeight()>0?root.getHeight():service.getResources().getDisplayMetrics().heightPixels;
+        int height=Math.round(Math.max(0,Math.min(fingerY,full)));
+        panel.setLayoutParams(new FrameLayout.LayoutParams(-1,height));
+        scrim.setAlpha(full>0?height/(float)full:0f);
+    }
+    private void setGestureExclusion(boolean on){
+        // Fully open: claim the bottom gesture zone so upward swipes close the shade
+        // instead of being swallowed by the system pill.
+        panel.setSystemGestureExclusionRects(on
+            ?java.util.Collections.singletonList(new android.graphics.Rect(0,0,Math.max(1,panel.getWidth()),Math.max(1,panel.getHeight())))
+            :java.util.Collections.<android.graphics.Rect>emptyList());
+    }
+    void releaseDrag(float velocityPxMs){
+        if(closed||!attached||!fingerDriven)return;
+        fingerDriven=false;
+        int full=root.getHeight()>0?root.getHeight():service.getResources().getDisplayMetrics().heightPixels;
+        int height=Math.max(0,panel.getHeight());
+        boolean open=height>dropDistance*0.5f||velocityPxMs>0.35f;
+        if(!android.animation.ValueAnimator.areAnimatorsEnabled()){
+            if(open){panel.setLayoutParams(new FrameLayout.LayoutParams(-1,-1));scrim.setAlpha(1f);setGestureExclusion(true);}
+            else destroy();
+            return;
+        }
+        dragAnim=android.animation.ValueAnimator.ofInt(height,open?full:0);
+        dragAnim.setDuration(open?200l:180l);
+        dragAnim.setInterpolator(open?new PathInterpolator(.32f,.72f,0f,1f):new PathInterpolator(.55f,.05f,.8f,.6f));
+        dragAnim.addUpdateListener(a->{
+            if(closed||!attached)return;
+            int value=(int)a.getAnimatedValue();
+            panel.setLayoutParams(new FrameLayout.LayoutParams(-1,value));
+            scrim.setAlpha(full>0?value/(float)full:0f);
+        });
+        if(open){
+            dragAnim.addListener(new android.animation.AnimatorListenerAdapter(){
+                @Override public void onAnimationEnd(android.animation.Animator animation){if(!closed&&attached)setGestureExclusion(true);}
+            });
+            dragAnim.start();
+        }else{
+            dragAnim.addListener(new android.animation.AnimatorListenerAdapter(){
+                @Override public void onAnimationEnd(android.animation.Animator animation){destroy();}
+            });
+            dragAnim.start();
+        }
+    }
     void close(){
         if(closed||animating||!attached)return;
         if(!android.animation.ValueAnimator.areAnimatorsEnabled()){destroy();return;}
         animating=true;
+        if(dragAnim!=null)dragAnim.cancel();
+        setGestureExclusion(false);
+        panel.getLayoutParams().height=-1; // a mid-drag close slides the full sheet
         // Mirror of the drop-in: slide the whole panel back up the same distance,
         // fading the scrim in parallel — no alpha tricks on the panel itself.
         scrim.animate().alpha(0f).setDuration(240).start();
         panel.animate()
-            .translationY(-service.getResources().getDisplayMetrics().heightPixels*0.6f)
+            .translationY(-dropDistance)
             .setDuration(320)
             .setInterpolator(new PathInterpolator(.55f,.05f,.8f,.6f))
             .withEndAction(this::destroy).start();

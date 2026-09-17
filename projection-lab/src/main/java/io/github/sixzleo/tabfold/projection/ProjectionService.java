@@ -219,7 +219,11 @@ public final class ProjectionService extends AccessibilityService implements Sen
             int strip=wc.getSystemService(WindowManager.class).getCurrentWindowMetrics()
                 .getWindowInsets().getInsets(WindowInsets.Type.statusBars()).top;
             if(strip<=0||strip>Math.round(80*wc.getResources().getDisplayMetrics().density))strip=Math.round(28*wc.getResources().getDisplayMetrics().density);
-            HomeStatusBar bar=new HomeStatusBar(wc,side->HomeControlPanel.open(id,side==HomeStatusBar.SIDE_CONTROL));
+            HomeStatusBar bar=new HomeStatusBar(wc,new ShadePullListener(){
+                @Override public void onPullFired(int side,float fingerY){HomeControlPanel.beginDrag(id,side==HomeStatusBar.SIDE_CONTROL,fingerY);}
+                @Override public void onPullDrag(float fingerY){HomeControlPanel.dragOn(id,fingerY);}
+                @Override public void onPullRelease(float velocityPxPerMs){HomeControlPanel.releaseOn(id,velocityPxPerMs);}
+            });
             WindowManager.LayoutParams p=new WindowManager.LayoutParams(-1,strip,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                     |WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,android.graphics.PixelFormat.TRANSLUCENT);
@@ -568,11 +572,39 @@ public final class ProjectionService extends AccessibilityService implements Sen
     }
     static void stop() {ProjectionService service=instance;if(service!=null)service.main.post(service::disableSelf);}
     @Override public void onAccessibilityEvent(AccessibilityEvent e){
-        if(FixedDualSession.active())return;
+        if(FixedDualSession.active()){checkDualRecentsEmpty(e);return;}
         if(e!=null&&e.getEventType()==AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED){if("com.miui.home".contentEquals(e.getPackageName()==null?"":e.getPackageName()))recentsVisible();return;}
         if(e!=null&&e.getEventType()==AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED){foregroundWindowId=e.getWindowId();foregroundWindowClass=e.getClassName()==null?"":e.getClassName().toString();}
         recentsVisible();
         appScopeDirty=true;update();
+    }
+    private long lastDualRecentsHome;
+    /**
+     * MIUI recents on a virtual display cannot return home by itself: after clearing all
+     * tasks it keeps an empty "no recent items" page instead of dismissing. Watch for that
+     * text and send the HOME key to that display, which relaunches the secondary home.
+     */
+    private void checkDualRecentsEmpty(AccessibilityEvent e){
+        if(e!=null&&e.getEventType()!=AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            &&e.getEventType()!=AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)return;
+        for(AccessibilityWindowInfo w:getWindows()){
+            if(w.getType()!=AccessibilityWindowInfo.TYPE_APPLICATION||!w.isActive())continue;
+            AccessibilityNodeInfo root=w.getRoot();if(root==null)continue;
+            try{
+                String pkg=String.valueOf(root.getPackageName());
+                if(!"com.miui.home".equals(pkg))continue;
+                boolean empty=containsRecentsLabel(root,"近期没有任何内容")||containsRecentsLabel(root,"无近期任务");
+                // Debug trace for the pending recents fix; drop once the behaviour is confirmed.
+                if(e!=null&&e.getEventType()==AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED)
+                    Log.i("DuoFixed","recents watch display="+w.getDisplayId()+" class="+(e.getClassName()==null?"":e.getClassName())+" empty="+empty);
+                if(!empty)continue;
+                int displayId=w.getDisplayId();
+                if(SystemClock.uptimeMillis()-lastDualRecentsHome<4000)continue;
+                lastDualRecentsHome=SystemClock.uptimeMillis();
+                Log.i("DuoFixed","Recents empty on display "+displayId+" -> HOME");
+                MobileHelper.dualKey(displayId,android.view.KeyEvent.KEYCODE_HOME);
+            }finally{root.recycle();}
+        }
     }
     @Override public void onMotionEvent(MotionEvent e){
         long now=SystemClock.uptimeMillis();

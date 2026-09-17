@@ -10,7 +10,12 @@ public final class ProjectionProvider extends ContentProvider {
         if(Binder.getCallingUid()!=2000 && Binder.getCallingUid()!=android.os.Process.myUid())throw new SecurityException("Own app or ADB shell only");
         Bundle b=new Bundle();
         if("fixed-dual-session".equals(method)){
-            if(arg!=null)new Handler(Looper.getMainLooper()).post(()->{if("0".equals(arg))FixedDualSession.stop();else if("1".equals(arg))FixedDualSession.start(ProjectionService.instance);});
+            // arg 0/1 also persists the preference, keeping the legacy single-screen
+            // pipeline recoverable through adb after the user-facing toggle was removed.
+            if(arg!=null)new Handler(Looper.getMainLooper()).post(()->{
+                if("0".equals(arg)){FixedDualSession.setEnabled(getContext(),false);FixedDualSession.stop();}
+                else if("1".equals(arg)){FixedDualSession.setEnabled(getContext(),true);FixedDualSession.start(ProjectionService.instance);}
+            });
             b.putString("status",FixedDualSession.status);b.putString("innerRenderer",FixedDualGpu.innerStats);b.putString("coverRenderer",FixedDualGpu.coverStats);return b;
         }
         if("fixed-dual-test".equals(method)){

@@ -17,3 +17,8 @@ dist/
 .env
 .env.*
 .claude-captures/
+
+# MiDuo reference: keep the analysis doc, not the decompiled bulk or third-party APK
+参考/miduo-decompiled/
+参考/miduo-simple/
+参考/*.apk

@@ -11,13 +11,30 @@ final class HomeStore {
     HomeStore(Context context){this(context,"duo_home");}
     HomeStore(Context context,String name){
         prefs=context.getSharedPreferences(name,0);
-        if(!"duo_home".equals(name)&&!prefs.contains("panel_seeded")){
-            if(!prefs.contains("layout")){HomeLayout source=new HomeStore(context).read();source.items.removeIf(HomeLayout.Item::widget);source.clamp();save(source);}
-            prefs.edit().putBoolean("panel_seeded",true).putBoolean("dock_seeded",true).apply();
+        if("duo_home".equals(name))return;
+        // Panels mirror the main desktop (MiDuo shares one state): whenever duo_home saved a
+        // newer layout, re-seed this panel from it and keep only the panel's own widgets.
+        HomeStore main=new HomeStore(context);
+        long stamp=main.stamp();
+        if(prefs.getLong("seeded_stamp",-1)==stamp&&prefs.contains("panel_seeded"))return;
+        HomeLayout source=main.read();
+        source.items.removeIf(HomeLayout.Item::widget);
+        HomeLayout previous=read();
+        for(HomeLayout.Item item:previous.items)if(item.widget()){
+            HomeLayout.Item copy=new HomeLayout.Item(item.id,"",Collections.emptyList());
+            copy.widgetId=item.widgetId;copy.spanX=item.spanX;copy.spanY=item.spanY;copy.slot=-1;
+            source.items.add(copy);
         }
+        source.clamp();
+        save(source);
+        prefs.edit().putBoolean("panel_seeded",true).putBoolean("dock_seeded",true)
+            .putBoolean("classified_seeded",true).putLong("seeded_stamp",stamp).apply();
     }
+    long stamp(){return prefs.getLong("layout_rev",0);}
     boolean dockSeeded(){return prefs.getBoolean("dock_seeded",false);}
     void markDockSeeded(){prefs.edit().putBoolean("dock_seeded",true).apply();}
+    boolean classifiedSeeded(){return prefs.getBoolean("classified_seeded",false);}
+    void markClassifiedSeeded(){prefs.edit().putBoolean("classified_seeded",true).apply();}
     HomeLayout read(){
         HomeLayout layout=new HomeLayout();
         try{
@@ -34,8 +51,17 @@ final class HomeStore {
                     boolean duplicate=false;for(HomeLayout.Item existing:layout.items)if(existing.widgetId==widget)duplicate=true;
                     if(!duplicate){HomeLayout.Item item=new HomeLayout.Item(id,"",Collections.emptyList());item.widgetId=widget;
                         item.spanX=Math.max(1,Math.min(HomeLayout.COLUMNS,value.optInt("spanX",2)));
-                        item.spanY=Math.max(1,Math.min(HomeLayout.ROWS,value.optInt("spanY",2)));layout.items.add(item);}
-                }else if(!apps.isEmpty())layout.items.add(new HomeLayout.Item(id,value.optString("title",""),apps));
+                        item.spanY=Math.max(1,Math.min(HomeLayout.ROWS,value.optInt("spanY",2)));
+                        item.slot=value.optInt("slot",-1);layout.items.add(item);}
+                }else if(!apps.isEmpty()){HomeLayout.Item item=new HomeLayout.Item(id,value.optString("title",""),apps);
+                    item.slot=value.optInt("slot",-1);layout.items.add(item);}
+            }
+            String grid=root.optString("grid","");
+            if(!grid.isEmpty()&&!grid.equals(HomeLayout.COLUMNS+"x"+HomeLayout.ROWS)){
+                // Grid density changed since this layout was written: keep the visual order,
+                // drop the stale coordinates and let ensurePlaced repack at today's density.
+                layout.items.sort(java.util.Comparator.comparingInt(item->item.slot));
+                for(HomeLayout.Item item:layout.items)item.slot=-1;
             }
             JSONArray dock=root.optJSONArray("dock");if(dock!=null)for(int n=0;n<dock.length();n++){String app=dock.optString(n,"");if(!app.isEmpty())layout.pin(app);}
             JSONArray known=root.optJSONArray("known");if(known!=null)for(int n=0;n<known.length();n++)layout.known.add(known.optString(n));
@@ -44,14 +70,15 @@ final class HomeStore {
         return layout;
     }
     void save(HomeLayout layout){
-        prefs.edit().putString("layout",encode(layout)).apply();
+        prefs.edit().putString("layout",encode(layout)).putLong("layout_rev",prefs.getLong("layout_rev",0)+1).apply();
     }
     private String encode(HomeLayout layout){
         try{
             JSONObject root=new JSONObject();JSONArray items=new JSONArray();
             for(HomeLayout.Item item:layout.items)items.put(new JSONObject().put("id",item.id).put("title",item.title).put("apps",new JSONArray(item.apps))
-                .put("widget",item.widgetId).put("spanX",item.spanX).put("spanY",item.spanY));
-            root.put("items",items).put("dock",new JSONArray(layout.dock)).put("known",new JSONArray(layout.known)).put("page",layout.page);
+                .put("widget",item.widgetId).put("spanX",item.spanX).put("spanY",item.spanY).put("slot",item.slot));
+            root.put("items",items).put("dock",new JSONArray(layout.dock)).put("known",new JSONArray(layout.known)).put("page",layout.page)
+                .put("grid",HomeLayout.COLUMNS+"x"+HomeLayout.ROWS);
             return root.toString();
         }catch(JSONException e){throw new IllegalStateException(e);}
     }

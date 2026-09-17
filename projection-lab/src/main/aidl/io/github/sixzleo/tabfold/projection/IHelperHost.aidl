@@ -15,5 +15,6 @@ interface IHelperHost {
     void dualKey(int displayId, int keyCode) = 10;
     Bundle dualContact() = 11;
     String svc(String command) = 12;
+    void dualSurface(int displayId, in Surface surface) = 13;
     void destroy() = 16777114;
 }
