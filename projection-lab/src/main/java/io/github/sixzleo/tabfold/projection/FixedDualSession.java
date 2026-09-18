@@ -34,10 +34,15 @@ final class FixedDualSession {
     /** Fixed dual is the one advertised desktop mode; the legacy single-screen pipeline stays dormant unless disabled via adb. */
     static boolean enabled(android.content.Context c){return c.getSharedPreferences("duo_dual",0).getBoolean("enabled",true);}
     static void setEnabled(android.content.Context c,boolean enabled){c.getSharedPreferences("duo_dual",0).edit().putBoolean("enabled",enabled).apply();if(enabled)start(ProjectionService.instance);else stop();}
+    private static long ownHomeSince;
     static void maintain(ProjectionService service){
         DuoHomeActivity.validateSecondaryHomes();
         boolean ownHome=service.getSystemService(android.app.role.RoleManager.class).isRoleHeld(android.app.role.RoleManager.ROLE_HOME);
-        if(!ownHome){stop();return;}
+        if(!ownHome){ownHomeSince=0;stop();return;}
+        if(ownHomeSince==0)ownHomeSince=SystemClock.uptimeMillis();
+        // A role grant lands mid home transition; requesting the fixed display topology at
+        // that exact moment blacked out the whole device. Let the transition settle first.
+        if(SystemClock.uptimeMillis()-ownHomeSince<2500)return;
         if(active()||!enabled(service)||!MobileHelper.ready()||SystemClock.uptimeMillis()<nextStart)return;
         if(!service.getSystemService(PowerManager.class).isInteractive()||service.getSystemService(KeyguardManager.class).isKeyguardLocked())return;
         nextStart=SystemClock.uptimeMillis()+10000;start(service);
