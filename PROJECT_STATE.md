@@ -81,6 +81,13 @@
 - **修复**：`FixedDualSession.maintain` 增加**角色稳定期**——进程首次观测到 ownHome 起 2.5s 内不起会话（`ownHomeSince` 跟踪，失去角色清零），让系统完成桌面转场后再请求拓扑。装机 08:56 版验证 running ✓。
 - **运维纠偏**：跨版本恢复 shared_prefs 后要检查 duo_dual/enabled——旧备份可能带 false，恢复后用 `content call fixed-dual-session --arg 1` 拉正。
 
+## 黑屏连环修复（第三十二轮，2026-09-18 上午，本地未推送）
+
+- **今日三次黑屏复盘**：共同点都是"装包/无障碍重启 → 旧会话拓扑刚被 binder 死亡释放 → 新进程几秒内再请求固定显示拓扑"——短时间内多次主屏映射翻转，MIUI 显示策略挂死，两块物理屏被我们的 OPAQUE 黑色覆盖层盖住=整机黑。08:52 首次启动没黑是因为那是当天唯一一次干净翻转。锁屏/解锁也可能叠加（frame 检测锁屏的 close 在熄屏后可能不执行，PROJECT_STATE 早有记录）。
+- **修复（装机 09:06 版，已验证 running+屏幕正常）**：①`FixedDualSession.maintain` 进程首调强制 8s 等待（nextStart 初值），让前一个进程的死亡释放落地；②`MobileHelperHost.fixedDualState` 增加**释放后 8s 冷却**（拒绝新拓扑请求返回 ERROR topology cooldown，app 侧 nextStart 10s 重试后自然过冷却）——UserService version 32→33 强制替换旧宿主（无线宿主走 app_process 每次全新加载无需版本）；③此前 09:01 版已修**僵尸清理误杀**：validateSecondaryHomes 只在**无会话**时执行（08:56:59 日志"live=[13]"证明搭建中 live 集不完整时误杀了 display 14 的合法桌面导致会话雪崩）。
+- **待观察**：锁屏/解锁稳定性、装包后首次起会话是否稳定单次翻转。若再黑屏：`am force-stop` 立即清覆盖层救急，然后抓 `dumpsys display` 与 DeviceState 日志。
+- 用户指示：**暂不推送**。
+
 ### 下一步
 
 1. 用户手测：合并热区手感、拖到顶部移除、文件夹 >9 成员分页、widget 缩放与滑动手势共存、锁屏/解锁双屏表现（结合下方锁屏调研结论）。
