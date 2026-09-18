@@ -23,7 +23,7 @@ final class MobileHelper {
     };
     static void init(Context c){
         if(initialized)return;initialized=true;context=c.getApplicationContext();
-        arguments=new Shizuku.UserServiceArgs(new ComponentName(context,MobileHelperHost.class)).daemon(true).processNameSuffix("glass_helpers").tag("glass_helpers").version(32);
+        arguments=new Shizuku.UserServiceArgs(new ComponentName(context,MobileHelperHost.class)).daemon(true).processNameSuffix("glass_helpers").tag("glass_helpers").version(33);
         Shizuku.addBinderReceivedListenerSticky(()->{if(!prefersWireless()){message="Shizuku 已启动";schedule();}});
         Shizuku.addBinderDeadListener(()->{if(!wirelessHost&&!prefersWireless()){host=null;binding=false;message="Shizuku 已停止，请在手机上重新启动";}});
         Shizuku.addRequestPermissionResultListener((code,result)->{if(code==312){message=result==PackageManager.PERMISSION_GRANTED?"已授权，正在连接":"未授予 Shizuku 权限";schedule();}});
@@ -79,6 +79,9 @@ final class MobileHelper {
         worker.execute(()->{int id=-1;try{if(current!=null)id=current.createDualContent(surface,w,h,density,inner);}catch(Exception e){android.util.Log.e("DuoFixed","Create",e);}
             final int result=id;main.post(()->done.accept(result));});
     }
+    /** Collapses/restores one content display's gesture strip: display resize + buffer resize. */
+    static void resizeDualContent(int id,int w,int h){IHelperHost current=host;
+        worker.execute(()->{try{if(current!=null)current.resizeDualContent(id,w,h);}catch(Exception ignored){}});}
     static void dualTouch(int id,android.view.MotionEvent event){
         IHelperHost current=host;android.view.MotionEvent copy=android.view.MotionEvent.obtain(event);
         worker.execute(()->{try{if(current!=null)current.dualTouch(id,copy);}catch(Exception ignored){}finally{copy.recycle();}});

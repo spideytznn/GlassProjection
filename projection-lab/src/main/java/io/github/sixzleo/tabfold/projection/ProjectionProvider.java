@@ -26,6 +26,14 @@ public final class ProjectionProvider extends ContentProvider {
             }
             b.putString("status",FixedDualTrial.status);return b;
         }
+        if("dual-band".equals(method)){
+            // arg "<displayId> <0|1>": collapses or restores one output's gesture strip so
+            // immersive apps fill the panel; the pill hides but band gestures keep working.
+            String bandStatus="ERROR arg '<displayId> <0|1>'";
+            if(arg!=null){String[] part=arg.split("[ ,]+");
+                if(part.length==2)try{bandStatus=FixedDualSession.setBand(Integer.parseInt(part[0]),!"0".equals(part[1]));}catch(NumberFormatException ignored){}}
+            b.putString("status",bandStatus);return b;
+        }
         if("helper-connect".equals(method)){
             if(Binder.getCallingUid()!=2000)throw new SecurityException("Shell host only");
             MobileHelper.init(getContext());

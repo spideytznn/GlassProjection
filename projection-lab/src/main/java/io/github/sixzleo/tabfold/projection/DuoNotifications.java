@@ -22,10 +22,19 @@ public final class DuoNotifications extends NotificationListenerService {
         Item(String key,String packageName,String label,String title,String text,long when,StatusBarNotification sbn){
             this.key=key;this.packageName=packageName;this.label=label;this.title=title;this.text=text;this.when=when;this.sbn=sbn;
         }
-        boolean open(Context context){
-            android.app.PendingIntent content=sbn.getNotification().contentIntent;
-            if(content==null)return false;
-            try{content.send(context,0,null);return true;}catch(Exception ignored){return false;}
+        boolean open(Context context,int displayId){
+            // Immutable PendingIntents (the norm now) ignore launch-display options and open
+            // on the default display, hidden behind our overlays. Launch the app's own entry
+            // activity scoped to this panel's display so the tap is always visible.
+            try{
+                android.content.Intent launch=context.getPackageManager().getLaunchIntentForPackage(packageName);
+                if(launch==null)return false;
+                launch.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                if(displayId>=0)
+                    context.startActivity(launch,android.app.ActivityOptions.makeBasic().setLaunchDisplayId(displayId).toBundle());
+                else context.startActivity(launch);
+                return true;
+            }catch(Exception e){return false;}
         }
     }
     private static volatile List<Item> items=Collections.emptyList();

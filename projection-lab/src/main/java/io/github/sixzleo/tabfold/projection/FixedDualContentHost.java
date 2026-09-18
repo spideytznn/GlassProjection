@@ -9,6 +9,7 @@ import java.util.*;
 /** Shell-owned task displays. Physical display topology is owned separately for the whole session. */
 final class FixedDualContentHost implements AutoCloseable {
     private final Map<Integer,VirtualDisplay> displays=new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<Integer,Integer> densities=new java.util.concurrent.ConcurrentHashMap<>();
     private final Context shell;
     FixedDualContentHost(Context context)throws Exception{shell=context.createPackageContext("com.android.shell",0);}
     int create(Surface surface,int width,int height,int density,boolean inner)throws Exception{
@@ -27,7 +28,7 @@ final class FixedDualContentHost implements AutoCloseable {
         else{display=shell.getSystemService(DisplayManager.class).createVirtualDisplay(name,width,height,density,surface,flags);
             surface.setFrameRate(120,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);}
         if(display==null)throw new IllegalStateException("Content display rejected");
-        int id=display.getDisplay().getDisplayId();displays.put(id,display);
+        int id=display.getDisplay().getDisplayId();displays.put(id,display);densities.put(id,density);
         if(displays.size()==1)applyPrimaryRate(true);
         try{
             IBinder windowBinder=(IBinder)Class.forName("android.os.ServiceManager").getMethod("getService",String.class).invoke(null,"window");
@@ -71,11 +72,20 @@ final class FixedDualContentHost implements AutoCloseable {
         VirtualDisplay display=displays.get(displayId);
         if(display!=null&&surface!=null)display.setSurface(surface);
     }
+    /** Resizes a content display so immersive apps can fill the panel when the strip collapses. */
+    void resize(int displayId,int width,int height){
+        VirtualDisplay display=displays.get(displayId);Integer density=densities.get(displayId);
+        if(display!=null&&density!=null)display.resize(width,height,density);
+    }
     void key(int displayId,int keyCode)throws Exception{
         if(!displays.containsKey(displayId)||(keyCode!=KeyEvent.KEYCODE_BACK&&keyCode!=KeyEvent.KEYCODE_HOME&&keyCode!=KeyEvent.KEYCODE_APP_SWITCH))return;
         if(keyCode==KeyEvent.KEYCODE_APP_SWITCH){
-            java.lang.Process process=new ProcessBuilder("am","start","--display",String.valueOf(displayId),"--activityType","3","-n","com.miui.home/.recents.RecentsActivity").redirectErrorStream(true).start();
-            try(java.io.InputStream in=process.getInputStream()){String result=new String(in.readAllBytes(),java.nio.charset.StandardCharsets.UTF_8);if(result.contains("Error:"))throw new IllegalStateException(result);}if(process.waitFor()!=0)throw new IllegalStateException("Recent tasks launch failed");return;
+            // MIUI recents on a virtual display routes restored tasks to invisible displays
+            // and starves input focus until the launcher ANRs. Our own switcher sheet is
+            // driven instead; it launches through the display-scoped LauncherApps path.
+            shell.sendBroadcast(new android.content.Intent("io.github.sixzleo.tabfold.projection.OPEN_RECENTS")
+                .setPackage("io.github.sixzleo.tabfold.projection").putExtra("display",displayId));
+            return;
         }
         if(keyCode==KeyEvent.KEYCODE_HOME){launchHome(displayId);return;}
         long now=SystemClock.uptimeMillis();
@@ -112,5 +122,5 @@ final class FixedDualContentHost implements AutoCloseable {
         try(java.io.InputStream in=process.getInputStream()){String result=new String(in.readAllBytes(),java.nio.charset.StandardCharsets.UTF_8);
             if(process.waitFor()!=0||result.contains("Error"))throw new IllegalStateException(result.trim());return result;}
     }
-    @Override public synchronized void close(){for(VirtualDisplay display:displays.values())display.release();displays.clear();applyPrimaryRate(false);}
+    @Override public synchronized void close(){for(VirtualDisplay display:displays.values())display.release();displays.clear();densities.clear();applyPrimaryRate(false);}
 }

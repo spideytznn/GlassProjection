@@ -1,8 +1,8 @@
 # PROJECT_STATE
 
-- 日期：2026-09-17（上午）
+- 日期：2026-09-18
 - 分支：duo-ui-preview
-- 本阶段：**固定双屏默认化（隐藏而非删除传统投影）+ 桌面预览双重前置校验 + MiDuo 参考实现搬运**；已装机验证 FixedDualSession running；全部改动未提交 git
+- 本阶段：**小白条独立占位（底部 28dp 手势带不再与应用内容重叠）**；已离线构建并过"删 APK 重建 + dex 标记 + 时间戳"三件套，已装机冒烟通过（见"小白条独立占位"节）；全部改动未提交 git
 
 ## 固定双屏默认化 + 预览校验 + MiDuo 搬运（第二十三轮，2026-09-17 上午）
 
@@ -87,6 +87,49 @@
 - **修复（装机 09:06 版，已验证 running+屏幕正常）**：①`FixedDualSession.maintain` 进程首调强制 8s 等待（nextStart 初值），让前一个进程的死亡释放落地；②`MobileHelperHost.fixedDualState` 增加**释放后 8s 冷却**（拒绝新拓扑请求返回 ERROR topology cooldown，app 侧 nextStart 10s 重试后自然过冷却）——UserService version 32→33 强制替换旧宿主（无线宿主走 app_process 每次全新加载无需版本）；③此前 09:01 版已修**僵尸清理误杀**：validateSecondaryHomes 只在**无会话**时执行（08:56:59 日志"live=[13]"证明搭建中 live 集不完整时误杀了 display 14 的合法桌面导致会话雪崩）。
 - **待观察**：锁屏/解锁稳定性、装包后首次起会话是否稳定单次翻转。若再黑屏：`am force-stop` 立即清覆盖层救急，然后抓 `dumpsys display` 与 DeviceState 日志。
 - 用户指示：**暂不推送**。
+
+## 黑屏真根因：direct 直通旁路（第三十三轮，2026-09-18 上午，本地未推送）
+
+- **实测证据链**：定时采样显示 t=8s 起黑、t=16s 会话已 running 但外屏 lum=0-1 持续 80s+；渲染统计 `direct presented=6`（昨天同期全是 `source/pyramid presented=600+`）；覆盖层 TextureView 图层 frame=3；虚拟屏上桌面 Activity 存活且 resumed；面板 ON、未锁屏。
+- **根因**：2e05dcf 新增的 GPU 直通旁路（FixedDualGpu identityFrames≥64 → goDirect → dualSurface 把 TextureView 表面直借虚拟屏）。昨天测试从未触发（一直走 shader 路径），今天稳定折叠态首次触发即黑。时序缺陷：goDirect 可能在虚拟屏创建完成前（contentId=-1）触发，dualSurface(-1) 静默无效 → 虚拟屏继续渲染到已无人消费的 EGL 输入表面 → 永久黑。这同时解释"切换双屏桌面黑很久"（每次会话稳定 256ms 后必进 direct 必黑）。
+- **修复**：直通旁路**禁用**（`if(false&&...)goDirect()`），回到昨天验证过的 shader 路径。装机验证：running + 外屏 mean=139/stddev=47，20 秒稳定态不再变黑 ✓。后续如要恢复直通需先修：①contentId>=0 才允许 goDirect；②swap 后校验虚拟屏实际输出表面；③leaveDirect 恢复路径实测。
+- **同包已带**：通知点击进入应用修复（DuoNotifications.Item.open → PendingIntent.send 携带 ActivityOptions.setLaunchDisplayId(面板 displayId)，不再落到被盖住的主屏）。
+- 待用户实测：锁屏/解锁、recents 点卡片、通知点击、清理后台回桌面。
+
+## 自研任务切换器 + 通知重绑（第三十四轮，2026-09-18 中午，本地未推送）
+
+- **结论定案**：MIUI 最近任务在虚拟屏上不可救（任务路由到不可见显示器、焦点悬空导致两次 input-ANR 击杀应用）。**虚拟屏的 APP_SWITCH 改为自研切换器**：FixedDualContentHost.key(APP_SWITCH) 发 `<pkg>.OPEN_RECENTS` 广播（带 display extra）→ 对应 DuoHomeActivity 打开 `recentsSheet()`。
+- **样式（用户指定）**：纸张堆叠——HomePager 横向卡片轮播（负 pageMargin 露邻卡 + PageTransformer 缩放/透明）、240×340dp 圆角玻璃卡（图标+应用名+位置）、**全屏无边框模糊底**（HomeSheet fullscreen 变体，与文件夹一致）、点卡片=launch（走验证过的 setLaunchDisplayId 链路）+dismissSheets、点空白关闭（blankTapCloses）。数据=进程内 LRU（launch() 时 noteRecent，上限 8，进程重启后为空）。
+- **通知监听重绑**：ANR/装包后 HyperOS 保持授权但不重绑——`cmd notification disallow_listener + allow_listener` 强制重绑，本轮实测 bound=1 ✓（app 内 ensureBound 逻辑同款，需 helper 就绪）。
+- **广播触发验证**：OPEN_RECENTS --ei display <cover content id>（content id 从会话状态取，viewports 解析会拿到陈旧条目）；display 过滤=实例 displayId 精确匹配。注意 adb 无线连接频繁抖动：装包后端口可能变（扫描脚本：python 并发探 192.168.2.166:20000-65535 取开放口再 connect）。
+- 待用户手测：卡片切换器实际观感（需先从桌面点开几个应用填 LRU）、通知中心内容、锁屏稳定性。
+
+## 全屏下拉面板与底部小白条冲突排查（2026-09-18，只排查未改代码）
+
+- **现象**：固定双屏下拉面板拖到底（全屏铺满）后，底部白色手势条仍能触发（上滑 HOME、长按 RECENTS）。
+- **根因**：双屏下物理屏触摸全走 "Duo X touch forward" 转发窗（`FixedDualOutput.java:68-85`），每个事件**先**喂 `FixedDualGestureFeedback.touch()`（`FixedDualOutput.java:56/:73`），返回 true 即吞掉、不转发虚拟屏。`FixedDualGestureFeedback.java:28` 把内容屏**底部 28dp 无条件**判为 BOTTOM（home）手势起点——`desktop` 标志（`DuoHomeActivity.barePanel`）只用于关左右边缘手势，管不到底部；顶部 48dp 倒是为 shade 触摸条保留（判 null 放行转发）。面板全屏化（`HomeControlPanel.releaseDrag`→MATCH_PARENT，`HomeControlPanel.java:266`）后，底部 52dp 关闭把手（`:198`）和通知列表下缘正落在这 28dp 内：点按被吞、上滑触发 HOME（白胶囊 `onDraw` `:57`）、按住 430ms 触发 RECENTS。面板侧 `setSystemGestureExclusionRects`（`:255`）只防 SystemUI 系统手势，防不了自家转发层 feedback；且 shade 是 NOT_FOCUSABLE overlay，面板打开时 `barePanel`（resumed+焦点+无弹窗+无 IME）仍为 true——但即使为 false 也没用，底部区根本没被任何条件门控。
+- **单屏模式不受影响**：`GestureNavigationOverlay.BottomView` 是独立小窗（底部 40dp），面板窗口后加、z 序更高会盖住它；问题集中在双屏转发路径。
+- **修法方向（未实施）**：让 `feedback.touch` 感知"该 display 的 shade 全屏打开"（HomeControlPanel 暴露 per-display 全屏态），打开时底部 28dp 放行转发（或只在面板非全屏时保留 BOTTOM 手势）。
+
+## 卡顿/ANR 第三击：空态扫描堵塞主线程（第三十五轮，2026-09-18 中午，本地未推送）
+
+- **ANR 实锤（第 3 次，10:40:41）**：`Subject: Input dispatching timed out (Duo cover touch forward is not responding. Waited 5000ms for MotionEvent(DOWN))`。我加的 checkDualRecentsEmpty 在**每个**无障碍事件（含高频 WINDOW_CONTENT_CHANGED）上 getWindows()+全树递归搜双文案，全在主线程 → 触摸转发排队超时 → ANR 杀进程 → 会话重建黑屏。这就是"为什么这么卡"的答案。
+- **修复**：仅在 `com.miui.home` 的 **TYPE_WINDOW_STATE_CHANGED**（低频）触发 + **3 秒节流**（lastDualRecentsScan）。装机 10:59 验证 running + 外屏 mean=138 ✓。
+- **教训入库**：无障碍服务的 onAccessibilityEvent 里做任何 getWindows()/树遍历必须节流+事件类型过滤——CONTENT_CHANGED 每秒可达数十次。
+- 今日三次 ANR 复盘：均为 input ANR，前两次（09:43/09:48）主因是 MIUI recents 在虚拟屏上焦点悬空（已用自研切换器绕开），第三次是本条扫描堵塞。
+
+## 通知点击显示目标修正（第三十六轮，2026-09-18 下午，本地未推送）
+
+- 用户反馈：后台卡片点击已好，通知点击仍不进应用。根因=我上一版把通知启动锚定到**物理屏**（shade 覆盖层所在屏，应用被自己的 overlay 盖住不可见）；正确目标是该面板对应的**虚拟内容屏**。
+- 修复：`FixedDualSession.contentIdForPhysical(physicalId)`（outputs 里 physicalId→contentId 映射）；HomeControlPanel 卡片点击 `content = active()?contentIdForPhysical(physical):physical`（非双屏回退物理=正确）。
+- 自测：shell 测试通知 → 通知中心卡片渲染 ✓（方差 33.4）；真实 contentIntent 启动待用户实测。
+
+## 锁屏输入陷阱修复（第三十七轮，2026-09-18 下午，本地未推送）
+
+- **用户复现**：wifi 断开后手机停在灰屏无法操作。窗口转储实锤：锁屏壁纸+系统通知遮罩在显示，而双屏会话仍 running——熄屏时 Choreographer 渲染循环随 vsync 停摆，frame() 里的锁屏检测（locked→close）永远不执行 → 触摸转发覆盖层压在锁屏上拦截解锁手势。即 PROJECT_STATE 锁屏调研里预言的"熄屏后 close 可能不执行"坑首次真实触发。
+- **修复**：会话注册 **ACTION_SCREEN_OFF 广播接收器**，熄屏立即 stop()（撤覆盖层+释放拓扑），解锁后由 maintain 正常重拉（稳定期+冷却已兜底时序）。
+- **实测**：adb 熄屏 → 会话立即关闭；亮屏解锁 → 会话自动恢复 running，屏幕 mean=135 ✓。
+- 救急手段：锁屏被卡时 `am force-stop` 即可恢复锁屏操作。
 
 ### 下一步
 
@@ -469,3 +512,140 @@ cmd notification allow_listener io.github.sixzleo.tabfold.projection/io.github.s
 - **下一步（新会话做，需干净上下文）**：Perfetto 抓一次拖拽（sched/input/view/binder tags）定位每帧 20ms 的具体回调；或二分法禁页面内容（先 widgets、再 FolderFan 预览、再文字阴影）对比拖拽帧。嫌疑清单：ViewPager 拖拽中触发的 populate/measure、DuoHomeActivity 80ms deliverCatalog 轮询链、AppWidgetHostView、文本 shadow。
 - 环境：双屏已恢复（pref=true、direct 模式 running）；单屏测试曾用 run-as 改 pref + force-stop + settings put 重绑无障碍（SharedPreferences 内存缓存，改文件必须重启进程）。
 - framestats 解析注意：HyperOS 输出列序与标准不同且时基混用（ns realtime + uptime），SwapBuffers 常为 -1（Vulkan）；逐段解析需先 dump 一行核对列义。
+
+## 小白条独立占位：底部手势带与应用内容分离（2026-09-18）
+
+- **现象/根因**：应用内底部菜单点不动。物理侧 forwarder 全屏收触摸，先过 `FixedDualGestureFeedback.touch()`，底部 28dp 带内的按下被手势门无条件吞掉（home/最近任务手势起点）；而虚拟显示是整屏高度，第三方应用底栏恰好延伸进这条带 → 带内控件永远收不到点击。
+- **修复（用户拍板：给小白条单独占位、应用底部上移）**：`FixedDualGestureFeedback.GESTURE_BAND_DP=28` 常量单源；`FixedDualOutput` 新增 `contentHeight=height−28dp`，TextureView 布局、GL 画布（FixedDualGpu 构造尺寸）、虚拟显示创建（createDualContent）三处统一缩短；底部露出 root 黑底。旋转/触摸逆矩阵、shader 全部不动；**GL bypass（FixedDualGpu `if(false&&...)` 与 goDirect/leaveDirect）零改动——用户明确不再使用 bypass、不许改造**。
+- **小白条可见性**：常驻静止淡药丸（α130、92×4dp、带中心 cy=−dp(14)）标示保留带；手势中放大上浮 `cy=−dp(14+4*progress)`；左右水滴返回分支不变。
+- **构建**：三件套已过（删 APK 重建、classes3.dex 含 contentHeight、时间戳 09-18 10:59）。compile 任务显示 UP-TO-DATE 但 dex 标记确认产物为新代码。
+- **装机验证（11:05 重建同代码包，排查会话执行，勿重复安装）**：install -r 后会话自动恢复（content=cover 1168×1635 / inner 2364×1595，各缩 77px=28dp×2.75 ✓，无黑屏无崩溃）；通知监听 adb 重绑 ✓。冒烟（外屏对照注入）：①静止态条带纯黑+中央白药丸（像素：带左 mean0/std0、药丸区 mean26/std52、面板区 mean184）②带内上滑（y1680→1380）→ `DuoGesture ACTION HOME`+面板收起（窗口 15→8）③把手区上滑（y1560→1260，条带上方）→ **无 DuoGesture 日志**+面板照常收起（15→8）——**面板底部触摸不再被小白条劫持**（另一会话用户报告的"下拉到底后小白条仍触发"同根因，一并解决）。待测：应用内底栏可点、内屏旋转侧药丸位置、折叠过渡。
+- 若 28dp 体感不合适，只调 GESTURE_BAND_DP 一处（手势带、占位、药丸同步）；虚拟显示变矮后应用布局整体重排属预期。
+
+## 条带观感：黑底改为应用底色延伸（2026-09-18 续）
+
+- 用户反馈保留带"非得黑色吗"→ 评估两条路：①窗口级真透明（TRANSLUCENT）会露出我们覆盖层底下系统渲染的桌面残影，且全窗混合给 SurfaceFlinger 加一整层合成负担（120Hz 稳定性刚调好），弃；②**shader 底边延伸**：画布恢复整屏高度，虚拟显示仍止于 contentHeight，`at()` 采样按 `contentFraction` 折算+钳制 → 条带显示应用自己最底一行颜色的延伸（全面屏手势导航的标准观感），`composite()` 对条带做 22% 渐进压暗保证白药丸对比度。窗口保持 OPAQUE，零合成开销。
+- **shader 三处同步改**（源头 `tools/helpers/LiveMirrorWindowProbe.java` + `tools/sync_dual_renderer.py` 替换模式 + 跑脚本重新生成 `FixedDualGpuProgram.java`，仅 3 行差异；Pyramid 零差异）：uniform `contentFraction`；`at()` toScreen 后 `p.y=min(p.y,cf)/cf`（identity/模糊两条路径统一生效，remap 在 sync 注入的 identity 采样之前）；probe 端固定 1f 保持原渲染。
+- 接线：`FixedDualGpu` 构造增 contentHeight（输入 SurfaceTexture 缓冲、金字塔 update 尺寸按输入高；bind/画布仍全高）；`FixedDualOutput` 画布/TextureView 恢复 (width,height)，虚拟显示保持 contentHeight。**GL bypass 依旧零改动**。
+- **与并行会话的 ShadeBandView 已合流**（对方在我改完后新增：下拉面板展开时条带铺 PANEL_TINT 并作为下滑关闭手柄，条带触摸先于手势门拦截）。叠加语义：面板关=应用底色延伸+常驻药丸；面板开=PANEL_TINT 实色盖住条带（盖在药丸之上）、条带点/拖=收起面板。编译与共包验证通过。
+- 三件套：APK 12:05；classes3.dex 含 contentFraction×2、ShadeBandView×3。**未装机**——待真机看：应用底色延伸是否自然、浅色应用上白药丸可见性（22% 压暗够不够）、面板开合时条带切换、折叠过渡。
+
+## 下拉面板全屏遮盖小白条（2026-09-18，用户手测通过）
+
+- **用户拍板**：面板是更高层级——平时小白条有保留带（上一节），面板全屏时把带整个盖住。实现（11:23 包，已装机）：①`HomeControlPanel.bottomCovered(displayId)`（panel 高度够到内容屏底 28dp 内即 true，PANEL_TINT 放宽为包可见）；②`FixedDualOutput` 新增 `ShadeBandView`（PANEL_TINT 实色、只画条带矩形、与 feedback 同旋转/平移变换，add 序在 feedback 之上=盖住药丸），`frame()` 每帧按 bottomCovered 刷可见性；③两处触摸监听合并为 `deliver()`：面板盖住时带内 DOWN 走 `shadeBandTouch`（点/拖>10dp=收起面板，不喂手势门），否则照旧先过 feedback。GL bypass 零改动。
+- **装机**：11:23 包 install -r 成功（当前手机上就是这个包；上节 12:05 共包**仍未装**，装它才能看到应用底色延伸条带）。装包后 content display 连续换代（22→25/26→37/38，一小时后自行稳定），通知监听已重绑。**用户手测确认好用**。
+- **调试教训（adb 对照测试被坑）**：`OPEN_SHADE` 调试广播会在 display 0 也开一份面板（旧怪癖），该窗口后加、z 序高于 forwarder——物理屏注入被它直接吃掉、截图也被它污染（之前"平滑渐变"其实是它铺满 display 0 的 GlassFade）。**远程测试一律走真实路径**（注入顶部条下拉，面板只开在内容屏），或先 `dumpsys window` 确认无 display-0 shade。
+- 运维：adb 端口又轮换（46791 失效→全端口扫描得 43223）；本连接输出流频繁丢空包，长命令结果落 `/data/local/tmp` 再 cat 才稳。
+
+## 桌面态条带纯透明：透出物理壁纸（2026-09-18 下午，13:44 包已装机验证）
+
+- **用户需求**：小白条保留带在**桌面**时纯透明，直接显示壁纸（应用态仍走上一节的底色延伸+22% 压暗）。
+- **实现**：①shader（probe 源 + sync 脚本再生成）增 `bandClear` uniform：`composite()` 里 `bandClear>.5&&strip>0` → 输出 `vec4(0.)`（预乘透明），压暗分支在其后；②`FixedDualGpu` volatile `bandClear` 进重绘变化条件（init 默认 0，probe 端不设=保持原渲染）；③`FixedDualOutput`：输出窗 OPAQUE→**TRANSLUCENT**、TextureView `setOpaque(false)`、root 背景黑→透明（blocked 态黑 View 兜底）、`frame()` 每帧按 `DuoHomeActivity.barePanel(contentId)` 推开关；④防残影：`FixedDualSession.outputOn(displayId)` 新增，`DuoHomeActivity.render()` insets 里物理输出屏实例底部加 `GESTURE_BAND_DP` 让位（防自家 dock 从透明条带里透出）。EGL 本就 RGBA8 无需改。
+- **装机验证（13:44 包）**：①桌面条带像素=壁纸级亮度纹理（mean 203-215，旧黑底 mean0），1635 接缝处无跳变；②**翻页判别**：注入翻页后内容区 diff mean 19.4、条带 diff=0——确认看到的是镜像虚拟内容+条带真透明（非整窗透明），且条带像素来自屏后壁纸源；③条带上滑仍 `DuoGesture ACTION HOME`（药丸照常）；④真实路径下拉（顶部条注入）面板照常开合、盖住条带；渲染计数健康（source=141/153 presented 匹配）。
+- **架构确认（排查副产品）**：v3 条带方案下 cover 屏的顶部条属 display 0 实例 → 面板开在 **display 0 物理窗**（后加、z 序高于 forwarder），条带遮盖/药丸抑制由面板窗自身完成；inner 屏的可见条带属内容屏（镜像内）→ 面板开在内容屏 → FixedDualOutput 的 ShadeBandView/shadeBandTouch 在该路径生效。两路自洽。**注意：display 0 面板底部 padding 区（把手下方 ~14dp）无响应**，关面板要点把手区（y≈1553-1674）。
+- **未测**：应用态条带观感（需内容屏前台有应用；barePanel=false → 底色延伸+压暗，也是上一节遗留待测项）；内屏（display 1）屏后无壁纸窗口，透明条带在内屏等效黑底（与旧观感相同，无回归）。**性能备注**：输出窗变 TRANSLUCENT 后 SF 对该层全窗混合，120Hz 长期稳定性待观察（翻页/滑动若掉帧优先回查这里，回滚=PixelFormat 还原 OPAQUE + setOpaque(true)）。
+
+## 条带三需求：桌面透壁纸/过渡动画/沉浸全屏（2026-09-18 下午）
+
+- **需求1 桌面纯透明（并行会话已实现，本轮确认合流）**：root 窗口 TRANSLUCENT + shader `bandClear`（barePanel 时条带打成全透明露物理壁纸）+ 桌面内容 band padding。本轮把 bandClear 从 0/1 硬切改为浮点，与我的改动共用。
+- **需求2 应用条带柔化+动画**：①`at()` 采样改**镜像延续**（条带显示应用底部内容的倒影延伸，接缝处连续，替代生硬的单行涂抹）；②`bandClear` 改浮点 uniform，FixedDualGpu draw 循环逐帧追赶（0.22 步进，~150ms）→ 桌面壁纸↔应用延伸之间**交叉淡化过渡**（premultiplied alpha：`bandA=1-strip*bandClear`）。shader 三处同步（helper+sync 脚本+重生成）。
+- **需求3 沉浸式全屏收起（机制+adb 试验通道）**：`setBandReserved(false)` → 药丸隐藏（`setPillVisible`，手势门保持接管条带触摸=原厂行为）+ GL 输入缓冲 `resizeContent` 拉满全高 + `VirtualDisplay.resize`（IHelperHost.aidl 新事务=14：resizeDualContent→MobileHelperHost→FixedDualContentHost.resize，密度表随建随查）。控制：`adb shell content call --uri content://io.github.sixzleo.tabfold.projection.surface --method dual-band --arg "<contentId> <0|1>"`（contentId 见 fixed-dual-session status 的 content=）。**自动检测未做**：外部无法观测第三方应用沉浸态（MiDuo 也没有，其手势层常驻）；后续可选 a) 虚拟显示加真导航栏窗口成为 insets 提供者（WMS 自动随沉浸隐藏，shell 权限待真机验证）；b) dumpsys insets 轮询。恢复保留带后应用菜单避让逻辑照旧。
+- 三件套：APK 14:08；classes3.dex bandTarget×2、resizeDualContent×3、dual-band×1。**未装机**：待验证镜面延伸观感、home↔app 交叉淡化、dual-band 0（视频铺满、药丸消失、底边手势仍回桌面）/1（恢复）。resize 期间 buffer 与 display 两路异步可能有 <100ms 拉伸瞬变，属试验期已知。
+
+## 真机验证轮：黑条根因修复 + 透壁纸确认 + 药丸未渲染排查中（2026-09-18 下午）
+
+- **用户报"条带是黑的"，截图取证（screencap -d 4639175068132267009 + PIL 像素分析 + 视觉模型）**：条带 (20,27,31)=PANEL_TINT 均色、无药丸 → ShadeBandView 在面板未开时常驻。**根因**：shadeCover addView 默认 VISIBLE，frame() 的 `if(shade!=shadeUp)` 首帧 false==false 永不触发 → 修复=构造时显式 GONE。已装机验证：黑条消失。
+- **透壁纸验证通过**：修复后条带 (202,205,208) 有结构、三次截图间完全静止（mean diff 0.24/255）而上方内容在变、无接缝（seam 0.6）→ 桌面态条带=物理壁纸透出 ✓（root TRANSLUCENT + texture opaque(false) 由并行会话先行铺好）。
+- **fade 路径 22% 压暗是死代码已修**（mix(alpha=1) 时 color 不参与）→ helper/tool/产物三处同步，压暗改作用于混合结果。
+- **dual-band adb 通道真机走通**：`content call --method dual-band --arg "61,0"` → "OK band collapsed"（arg 用逗号，空格会被远端 shell 拆开）。收起前后条带像素不变属预期（收起后显示虚拟桌面自己的带位壁纸，与透出的物理壁纸同图）。
+- **未解：常驻药丸不渲染**。四张截图全屏胶囊检测均无（深色背景上也无）；shot8 手势中途也只有 +13.5 偏移非中心凸起 → 疑 feedback 视图 onDraw 没执行或画在别处。同窗口 ShadeBandView 能画出（视图绘制链路本身没问题）。已加探针：onDraw 首次调用日志（尺寸/pillVisible/progress）+ Output 侧 root.post 日志（attached/尺寸/vis/turn/band）。**instrumented 包已装上手机（掉线前 install Success），重连后跑 am start 恢复 + `adb shell "logcat -d | grep DuoBand"` 取证**。
+- **无线 adb 掉线**：重装后设备 offline，旧端口 43223 不通、mdns 无发现（已知问题）→ 等用户提供新端口。
+- 本地临时截图已清理。
+
+## 排查：开合动画与 main 的差距（2026-09-18）
+
+- **结论：不是回归 bug，是 2e05dcf 起 fixed dual 成为唯一对用户开放的桌面模式，传统开合动画管线被整体旁路，两条管线开合语义不同。**
+- 旁路点 `ProjectionService.updateState()`（ProjectionService.java:434）：`FixedDualSession.active()` → `allowed=false;reset();closeWindow();return;`。`FixedDualSession.enabled()` 默认 true（`duo_dual` pref）；设置页「切屏时机 60°/120°」「悬停」「作用范围」「滑动恢复」已藏进 `if(legacy)` 仅 adb 关闭时可见。
+- 切屏语义：main=角度阈值+滞回（>60° 切内屏、<120° 切外屏、FoldHoldGate 3s 悬停、动画仅桌面/锁屏）；分支=`FixedDualPolicy.update()` 只认物理端点（触点闭合→仅外屏、完全展平→仅内屏、**中间角度双屏同亮 BOTH**），端点切换为瞬时黑幕（FixedDualCurtains/FixedDualOutput.black），无阈值无悬停；动效公式未变（ProjectionMath 与 main 零 diff，FixedDualGpu.draw ≈ DesktopProjection.onDraw 平移，两屏各跑一份、作用于虚拟显示）。
+- 时序变慢：首启 +8s（nextStart）、拿到 home 角色 +2.5s settle（d8b1523）、重试 10s、熄屏即关会话（ACTION_SCREEN_OFF）→ 感知"动画出现晚/偶尔没有"。
+- 未提交改动（band 三需求）另有观感差异：`contentFraction` 压缩全采样、条带镜像延伸+bandClear 交叉淡化、bypass 显式禁用（`if(false&&…)`）。
+- 下一步（待用户拍板）：a) 接受新语义；b) adb 关 `duo_dual` 回传统管线对照；c) 若要旧手感，在 FixedDualPolicy 恢复角度阈值/渐变或缩短 settle 时序。
+
+## 倒影雾化 + 三缺陷修复轮（2026-09-18 傍晚，真机迭代 6 轮构建）
+
+- **药丸不渲染根因确认并修复**：探针日志证明 onDraw 正常执行（尺寸/状态全对）但像素不可见 → 该 ROM 合成器上 TextureView 层压过同窗口普通视图（11:05 版药丸可见是因为当时纹理不覆盖条带）。**修复：feedback 视图移入 forwarder 独立窗口**（永远在输出窗口之上）。真机验证 pill lift 17.6→49.5 ✓。
+- **面板态黑条修复**：ShadeBandView（实色 PANEL_TINT 延续）整体删除——面板打开时条带改走和应用一致的镜像+雾化（面板底边的倒影），"点条带收面板"手势保留（shadeBandTouch 不变）；药丸在面板态主动隐藏（frame() 统一管 pillVisible=bandReserved&&!shade&&!blocked，setPillVisible 带变更守卫防 120Hz 无效重绘）。
+- **通知点击跳转修复（待用户真通知复验）**：原 contentIntent.send + setLaunchDisplayId 对不可变 PendingIntent（如今绝对主流）会忽略显示域 → 落到默认屏（藏在覆盖层后）= 看似无反应。改为 getLaunchIntentForPackage + startActivity(launchDisplayId)（与面板磁贴同模式，SAW 豁免后台启动）。
+- **倒影模糊迭代**：5 点十字→9 点双环（稀疏大半径=重影伪影，细节不降反升）→ **13 tap 双半径交替圆盘采样（r=4+30*band px 渐进）**：细节 5.53→2.28→0.81 单调雾化无重影 ✓。**SF 系统雾化（BackgroundBlurDrawable/HomeGlass 反射）在 a11y overlay 窗口上试了两轮（TRANSPARENT/TRANSLUCENT）均不执行**（SF 不处理、且残留 50% 变暗），已撤——shader 圆盘模糊为最终方案。
+- **shader 压暗修正在位**：`dim=1-(0.22+0.4*strip)*strip` 渐进作用于混合结果；镜像映射 `y>cf → cf-(y-cf)`。
+- adb：无线端口易变，mdns 发现不到时对 192.168.2.166 扫 30000-50000 段可找到（本轮 43003）。`input -d <虚拟屏id>` 注入到不了 a11y overlay，**注入物理屏由 forwarder 转发**才是正确通道（顶部下滑开面板/底部手势都这样测）。
+- 全部改动未提交；构建 15:2x 三件套过（marker 30.*band）。
+
+## 排查：开合瞬间左右拉伸/上下压缩——band 改动的金字塔采样畸变（2026-09-18）
+
+- **用户感知**：打开瞬间内容左右拉伸、上下压缩；正常时中轴线（铰链边）一侧应始终对齐屏幕高度。远程 origin/duo-ui-preview（=d8b1523，代码与 HEAD 相同）无此问题 → 差异来自未提交的 band 系列改动。
+- **根因**：`FixedDualGpu` 输入缓冲从全高 `height` 改为 `contentHeight`（`setDefaultBufferSize`、`createDualContent`、`pyramid.update(...,width,contentHeight)`），但 shader 的 `screen` uniform 仍是画布 `(width,height)`。`at()` 里 `extent=screen/max(screen)` 的 letterbox 逆映射必须与 `FixedDualGpuPyramid.update` COPY 阶段的 `extent=(w/longest,h/longest)` 同一套尺寸（缓冲尺寸），现在画布/缓冲不一致 → 金字塔采样在失配轴上做**以中心为锚的线性缩放**，系数 `height/contentHeight`（28dp 条带 ≈ 77-84px，约 3.5-4% 宽高比畸变）。铰链边因此不再钉在屏边/中轴。
+- **为何只在开合瞬间**：`needsPyramid = opacity≥.001 && tilt≠0 && blurStrength>0`——只有折叠动效进行中的帧走金字塔路径（畸变）；`tilt==0 && crop==0` 静止帧走 native 直采（正确）→ 动画中变形、到位瞬间弹回正确比例，正是"打开的瞬间拉伸"的来源。bypass 已被 `if(false&&…)` 禁用，不影响此分析。
+- **为何 probe 没测出**：LiveMirrorWindowProbe 硬编码 `contentFraction=1f`（缓冲=画布），该路径从未在 contentFraction<1 下验证过。
+- **顺带发现（三处同步隐患）**：工作区 `FixedDualGpuProgram.java` 生成的圆盘采样是 `r=3.+26.*band`，而 `tools/sync_dual_renderer.py` 里是 `r=4.+30.*band`——生成物与脚本不同步，下次重生成会悄悄改观感。
+- **修复方向（未实施）**：`screen` 改为源缓冲尺寸 `(width,contentHeight)`，并在 `resizeContent()`（dual-band 收起/恢复）里同步更新；注意 `at()` 的 band 采样支路 `px.y=1./(screen.y*contentFraction)` 目前按画布语义写死，改 screen 语义后此处须改为 `1./screen.y`，两处必须一起改。sigma 的 `canonicalSize` 也会随 screen 一致化为缓冲尺寸（与 probe 语义一致）。
+
+## 倒影让位于开合动画（2026-09-18 晚）
+
+- 用户反馈：倒影盖在开合遮罩动画上、且倒影了动画内容——动画应是最上层。两层修复：
+  1. **遮罩面板（下拉面板）开合期间**：frame() 的 bandClear 条件从 barePanel 扩为 `clear||shade`（bottomCovered）——面板挂载期间（含滑入滑出全程，按高度判定不受 translation 影响）条带整体透壁纸，面板成为唯一顶层视觉，不再镜像面板内容；动画结束 destroy 后交叉淡化回应用镜像。
+  2. **折叠开合动画期间**：shader 新增 `bandMix` uniform（0..1，draw 循环按 `tilt==0&&crop==0` 置目标、0.3 步进追赶），`cf=mix(1,contentFraction,bandMix)`——折叠效果激活时条带并入纸张本体（底部行延伸，无镜像/无压暗/无 punch），动画结束条带淡入回归。
+- 真机验证：面板开（shade window 存在）时条带 RGB 与桌面态完全一致=(104.7,109.9,113.0)=透出壁纸 ✓（面板底镜像值应为 ~140 已不出现）。折叠路径为代码审查+下次物理开合确认。
+- 运维：注入开面板的下滑要慢（400ms 全程）且确认 `dumpsys window windows | grep -c "Duo home shade"`>0 再截图——快速下滑可能不开面板，之前两轮误测由此而来。
+- 三件套：bandMix×3 in classes3.dex，APK 15:5x，install -r 完成。
+
+## 修复：开合瞬间左右拉伸/上下压缩——金字塔采样错位（2026-09-18 晚）
+
+- **用户补充定位**：仅双屏同开（BOTH 中间角度段）可见，端点单屏正常——与根因吻合：端点处折叠动效不活跃（展平 tilt=0 走 native 直采、闭合透明度 0），中间角度段金字塔模糊路径全程活跃。
+- **两个叠加错位**：①`screen` uniform 传画布 `(width,height)` 而金字塔按缓冲 `(width,contentHeight)` 构建 → at() 的 extent 逆映射在失配轴上以中心为锚缩放 `height/contentHeight`（~3.5-4%）；②上一节 bandMix 的 `cf=mix(1,contentFraction,bandMix)` 折叠时把整体映射缩向 1 → 内容区纵向拉伸同比例（两错近似抵消成"整体缩放"而非宽高比畸变，掩盖了症状）。
+- **修复（驱动侧 + 三处同步）**：①`FixedDualGpu` `screen` 改传缓冲 `(width,contentHeight)`，`resizeContent()` 同步刷新（sigma/pixelScale 缩放随之一致为缓冲基准）；②`at()`：`cf` 恒为 `contentFraction`，`yS=y>cf?cf+(cf-y)*bandMix:y`——bandMix 只在**条带内**选镜像(1)/底边行延伸(0)，内容区画布→缓冲映射恒 1:1（上节"折叠时条带并入纸张"的正确实现，不再连带拉伸内容区；静止态与原公式代数等价）；③圆盘采样 `px.y` 改 `1./screen.y`（缓冲 texel）。composite() 的 strip/bandMix 压暗与 punch 门控保留不变。
+- probe FOLD_FRAG + sync_dual_renderer.py 已同步；重生成校验：FixedDualGpuProgram 仅含预期两处 delta（at() 映射 + px），FixedDualGpuPyramid 字节不变；probe 在 contentFraction=1 下行为不变。上节记录的 r=3+26/4+30 不同步已被并行轮次自行对齐（均 4+30）。
+- **验证**：`assembleDebug`（init 脚本+离线）过；dex 标记 `yS/max(cf`×1、旧 `cf-(y-cf):y)`×0、旧 `1./(screen.y*max`×0、时间戳 15:37（假构建三件套之标记法）。**未装机**——手机 offline 等端口，且已装的 15:5x bandMix 包不含本修复；装机后预期：双屏同开折叠全程内容区 1:1（中轴线一侧钉住屏幕高度），条带动画中底边延伸、静止后淡入镜像。
+
+## 保留带收窄 28dp→20dp（2026-09-18 晚）
+
+- 用户反馈条带占屏过多。GESTURE_BAND_DP 28→20（单源常量：显示高度 contentHeight、手势门、桌面 padding、shadeBandTouch 全部派生自动跟随）；药丸位置公式从硬编码 dp(14+4p) 改为 dp(GESTURE_BAND_DP*.5f+2p) 随带高居中。
+- 真机验证：内容平坦至 y≈1655，过渡起于 1657=1712−55px ✓（20dp×2.75）；过渡为平滑渐变无硬线；药丸新位置 lift=24.9 清晰。屏幕多得 22px 内容高度。
+- 若还要更窄（如 16dp）只改常量一处。
+
+## 方案转向：放弃条带倒影，任务显示铺满全高（2026-09-18 晚）
+
+- **用户拍板**："别搞什么模糊倒影了，直接就透明，不要取色了，让应用自己的底面留多一点空间"——放弃镜像/圆盘采样/压暗/壁纸 punch 的整条取色链路，任务显示（虚拟显示+GL 缓冲）**直接铺满整屏**，应用自己的底面填满原条带区，即已验证的 dual-band 收起态常态化。
+- **实现**：①`FixedDualOutput.contentHeight=height`（不再扣 GESTURE_BAND_DP），新增 `bandTop=height−bandPx` 仅作触摸区；②`shadeBandTouch` 判定改用 bandTop（"点条带收面板"手势保留）；③`DuoHomeActivity` insets 的条带避让从"仅物理输出屏实例（outputOn）"扩展为"会话激活即全部实例"（内容屏全高后 dock 需让位）；④shader 侧零改动——contentFraction 恒 1，at()/composite() 的镜像/圆盘/压暗/bandClear 分支全部代数失效（保留代码不删，避免与并行轮次冲突）；⑤dual-band adb 钩子退化为药丸开关（resize 两态同值）。
+- **联动确认**：并行轮次 15:45 的 GESTURE_BAND_DP=20 已包含在 15:57 构建中（bandTop/桌面避让自动跟随）；手机 15:57:24 装的即此包（含 20dp + 全高 + 上节的采样错位修复）。
+- **代价（用户已知）**：应用底部 bandPx 区域可见但触摸仍归手势门（对齐 HyperOS 全面屏平台行为）；桌面 dock 上移 bandPx（原物理屏让位逻辑推广）；桌面条带从"透物理壁纸"变为"透自身壁纸"（同一张图，观感应无差）。
+- **验证状态**：构建过；装机过；装后手机停在锁屏（KeyguardDrawComplete=false）→ 会话 idle 属设计行为，解锁后自动起，待用户解锁真机开合验证（全高应用、无倒影、动画 1:1）。
+
+## 通知面板底部留白缩小（2026-09-18 晚）
+
+- 用户反馈：下拉通知面板最底部空白偏多。HomeControlPanel 两处常量缩小：列表下方 grab-zone `listSize.bottomMargin` 52→36dp、底部关闭手势条高度 52→40dp（面板底部 padding `max(safe.bottom,14dp)` 不动），总留白约 118→90dp。
+- 三件套验证：旧 APK 删除重建、HomeControlPanel*.class 15:59 重编译、APK 时间戳 15:59；16:00 `install -r` 成功（同签名保数据）。
+- 冒烟：装后无障碍绑定在、进程起（ps 可见，pidof 不可见属正常）、fixed-dual 会话 running；OPEN_SHADE 广播后 `dumpsys window` 出现 "Duo home shade" 窗口，两虚拟显示 HOME 后归零——面板开/关正常。验证时用户正在主屏用聊天应用，未受影响（面板只在虚拟显示）。
+- 底部留白视觉效果待用户下次下拉确认；若仍偏多，继续降这两处即可（再各减 8-12dp）。
+
+## 药丸按背景反色：GL 亮度探针（2026-09-18 晚）
+
+- **用户需求**：小白条白色透明，白底页面看不清——按背景亮度反色。
+- **实现**：①`FixedDualGpu` 新增 `setLuminanceProbe(x,y,w,h,sink)`——draw 循环里 `glReadPixels`（drawArrays 之后、eglSwapBuffers 之前）读药丸区域 128×2 像素，仅在有新内容帧时且 ≥300ms 限频，Rec.709 亮度均值、alpha<40 像素跳过，结果 main.post 回主线程；探针坐标画布空间 y=bandPx/2（GL row 0=画布底=药丸带，turn 无关：feedback 与 texture 同变换）。②`FixedDualGestureFeedback.setPillLuminance(lum)` 滞回切换（>0.70 变黑、<0.55 回白），`onDraw` 药丸色 `pillDark?BLACK:WHITE`（侧滑箭头的白色不动）。③`FixedDualOutput.onSurfaceTextureAvailable` 接线 `gpu.setLuminanceProbe(width/2-64, bandPx/2, 128,2, feedback::setPillLuminance)`；双屏各自探各自条带。
+- **成本**：每 ≥300ms 一次 1KB 读回 + GL 同步，在独立 GL 线程，静态页不触发（无新帧不重绘不探）。
+- **验证**：构建过（dex 标记 setLuminanceProbe/setPillLuminance ×1）；16:07:47 装机（含并行轮次 15:59 的面板留白改动，未被覆盖）。装机时手机锁屏 → 会话 idle 属设计，解锁后生效；**反色效果待用户白底页面实测**。
+
+## 崩溃排查：glReadPixels 探针损坏堆 → 全删，反色改 PixelCopy（2026-09-18 晚）
+
+- **用户报障**：固定双屏几秒后闪退回单屏、无障碍突然掉。取证：**3 个 tombstone 全是我方进程的 SIGSEGV，位置全在 ART ConcurrentCopying GC 扫堆（HeapTaskDaemon）**=堆损坏晚期爆炸；时间 16:08:24/16:15:39/16:16:43，**全部在 16:07:47（glReadPixels 探针版）装机之后**，而 15:57 全高构建跑了 ~10 分钟零 tombstone。更细的相关性：16:15:38.9 输出挂载日志后 0.8s 即死——正是首次探针触发点（新帧+300ms）。16:07 构建里唯一新增的原生内存写入=探针的 `glReadPixels`（从 EGL 窗口表面回读到 1KB direct buffer）。
+- **根因判定**：GL 窗口表面回读在驱动侧踩雷（疑似驱动按整表面尺寸写回，越界砸堆；GC 延迟爆出）。**该路径禁止复活**——注释已写进代码（FixedDualOutput pillProbe 上方）。
+- **修复**：①FixedDualGpu 的探针字段/setter/draw 循环读回**全部删除**（dex 标记 glReadPixels×0）；②反色改走 **PixelCopy(Surface, strip, bitmap, callback)** 异步系统拷贝（FixedDualOutput.pillProbe，400ms 循环、in-flight 防重入、close() 停止；srcRect 画布空间底部条带）；③翻转时打 `DuoBand pill dark/light lum=` 日志便于远程对照 screencap 校验采样方向（PixelCopy 对 Surface 的 srcRect Y 朝向未文档化，若反了改为 top=bandPx/2）。
+- **弯路记录**：①PixelCopy 没有 TextureView 重载（只有 SurfaceView/Surface/Window），用 `surface` 字段；②multi-catch RuntimeException|IllegalArgumentException 父子类编译错；③一次构建失败后 `install -r` 装了旧包（假构建陷阱重现）——判定以 BUILD SUCCESSFUL + dex 标记 + 时间戳三件套为准。
+- **附带发现**：16:12:44 ActivityManager `Force stopping ... SwipeUpClean`——MIUI 上划清理也会杀我们 + 解绑无障碍（与崩溃无关的另一条掉线路径）；建议用户最近任务里锁定本应用。
+- **装机**：16:29:25（PixelCopy 版）。待用户解锁验证：几分钟无崩溃（此前 1-37s 必崩）+ 白底页药丸变黑；之后远程 grep `DuoBand pill` 对照 screencap 确认采样方向。
+
+## 崩溃修复验证通过 + 药丸再下沉（2026-09-18 晚）
+
+- **PixelCopy 版验证**：tombstone 维持 3 个零新增（此前 1-37s 必崩，16:29 版运行数分钟稳定）；`DuoBand pill` 日志真实翻转（lum 0.537→light、0.803→dark），采样方向正确——崩溃根因（glReadPixels 回读）与反色功能双双确认。
+- **用户微调**：药丸仍显眼 → 静止中心从"带内居中（离底 GESTURE_BAND_DP/2=10dp）"下沉到**离底 6dp**（新常量 `FixedDualGestureFeedback.PILL_BOTTOM_DP=6f`，onDraw cy 公式与 PixelCopy 采样条带同源跟随）；手势中的抬升 `2*progress` 保留。药丸底边距屏底约 4dp。
+- 16:33:01 装机（dex 标记 PILL_BOTTOM_DP×1）；装后手机锁屏 → 会话 idle 属设计，解锁生效。

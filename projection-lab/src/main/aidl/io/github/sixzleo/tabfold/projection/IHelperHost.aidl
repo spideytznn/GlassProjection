@@ -16,5 +16,6 @@ interface IHelperHost {
     Bundle dualContact() = 11;
     String svc(String command) = 12;
     void dualSurface(int displayId, in Surface surface) = 13;
+    void resizeDualContent(int displayId, int width, int height) = 14;
     void destroy() = 16777114;
 }

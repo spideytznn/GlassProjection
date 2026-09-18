@@ -82,11 +82,18 @@ public final class MobileHelperHost extends IHelperHost.Stub {
         if(fixedLifetime!=null){fixedLifetime.unlinkToDeath(fixedDeath,0);fixedLifetime=null;}
         fixedState=-1;fixedStateGlobal=null;fixedCancel=null;
     }
+    private long lastReleaseAt;
     @Override public synchronized String fixedDualState(int state,IBinder lifetime){
         caller();long identity=Binder.clearCallingIdentity();
         try{
-            if(state==-1){releaseFixedState();return "OK released";}
+            if(state==-1){releaseFixedState();lastReleaseAt=SystemClock.uptimeMillis();return "OK released";}
             if(state!=5&&state!=6)return "ERROR unsupported fixed state";
+            // Rapid release/request flips blank MIUI's display policy for good: after a
+            // release (session close or app death), the next topology request must wait out
+            // a cooldown so exactly one clean flip happens.
+            long sinceRelease=SystemClock.uptimeMillis()-lastReleaseAt;
+            if(lastReleaseAt>0&&sinceRelease<8000)
+                return "ERROR topology cooldown "+(8000-sinceRelease)+"ms";
             if(fixedState>=0)return state==fixedState?"OK already fixed":"ERROR primary mapping cannot change during a session";
             Object dm=Class.forName("android.hardware.display.DisplayManagerGlobal").getMethod("getInstance").invoke(null);
             Object info=dm.getClass().getMethod("getDisplayInfo",int.class).invoke(dm,0);
@@ -137,6 +144,11 @@ public final class MobileHelperHost extends IHelperHost.Stub {
     @Override public synchronized void dualSurface(int displayId,android.view.Surface surface){
         caller();long token=Binder.clearCallingIdentity();
         try{if(dualContent!=null)dualContent.surface(displayId,surface);}catch(Exception e){android.util.Log.e("DuoFixed","Surface swap failed",e);}
+        finally{Binder.restoreCallingIdentity(token);}
+    }
+    @Override public synchronized void resizeDualContent(int displayId,int width,int height){
+        caller();long token=Binder.clearCallingIdentity();
+        try{if(dualContent!=null)dualContent.resize(displayId,width,height);}catch(Exception e){android.util.Log.e("DuoFixed","Resize failed",e);}
         finally{Binder.restoreCallingIdentity(token);}
     }
     @Override public synchronized String status(){caller();return "uid="+android.os.Process.myUid()+" requested="+running+" renderer="+(renderer!=null&&renderer.isAlive())+" controller="+(controller!=null&&controller.isAlive());}

@@ -11,12 +11,14 @@ final class FixedDualGpu implements AutoCloseable {
     static volatile String innerStats="idle",coverStats="idle";
     private final HandlerThread thread=new HandlerThread("Duo-live-fold");
     private final Handler worker,main=new Handler(Looper.getMainLooper());
-    private final int width,height;private final boolean inner;
+    private final int width,height;private volatile int contentHeight;private final boolean inner;
     private final java.util.function.Consumer<String> failed;
     private volatile boolean closed;
     private EGLDisplay display=EGL14.EGL_NO_DISPLAY;private EGLContext context=EGL14.EGL_NO_CONTEXT;private EGLSurface window=EGL14.EGL_NO_SURFACE;
     private SurfaceTexture source;private Surface input;private FixedDualGpuPyramid pyramid;private int external,program;
     private boolean dirty,hasFrame,pyramidDirty;private float lastTilt=Float.NaN,lastCrop,lastOpacity,lastStrength;
+    private volatile float bandClear,bandTarget;private float lastBandClear=-1;
+    private volatile float bandMix=1,bandMixTarget=1;private float lastBandMix=-1;
     private long sourceFrames,pyramidUpdates,presentedFrames,statsAt;
     private final float[] matrix=new float[16];
     private final ProjectionAngleMotion motion=new ProjectionAngleMotion();
@@ -27,8 +29,8 @@ final class FixedDualGpu implements AutoCloseable {
     private EGLConfig config;
     private boolean direct;
     private int identityFrames;
-    FixedDualGpu(Surface output,int width,int height,boolean inner,java.util.function.Consumer<Surface> ready,java.util.function.Consumer<String> failed,java.util.function.BiConsumer<Boolean,Surface> swap){
-        this.width=width;this.height=height;this.inner=inner;this.failed=failed;this.output=output;this.swap=swap;thread.start();worker=new Handler(thread.getLooper());
+    FixedDualGpu(Surface output,int width,int height,int contentHeight,boolean inner,java.util.function.Consumer<Surface> ready,java.util.function.Consumer<String> failed,java.util.function.BiConsumer<Boolean,Surface> swap){
+        this.width=width;this.height=height;this.contentHeight=contentHeight;this.inner=inner;this.failed=failed;this.output=output;this.swap=swap;thread.start();worker=new Handler(thread.getLooper());
         worker.post(()->{try{init(output);main.post(()->{if(!closed)ready.accept(input);});worker.post(draw);}catch(Exception e){error(e);}});
     }
     private void init(Surface output){
@@ -44,16 +46,36 @@ final class FixedDualGpu implements AutoCloseable {
         int[] names=new int[1];GLES20.glGenTextures(1,names,0);external=names[0];GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,external);
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MIN_FILTER,GLES20.GL_LINEAR);GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MAG_FILTER,GLES20.GL_LINEAR);
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_S,GLES20.GL_CLAMP_TO_EDGE);GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_T,GLES20.GL_CLAMP_TO_EDGE);
-        source=new SurfaceTexture(external);source.setDefaultBufferSize(width,height);source.setOnFrameAvailableListener(s->dirty=true,worker);input=new Surface(source);
+        source=new SurfaceTexture(external);source.setDefaultBufferSize(width,contentHeight);source.setOnFrameAvailableListener(s->dirty=true,worker);input=new Surface(source);
         input.setFrameRate(120,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
         FloatBuffer vertices=ByteBuffer.allocateDirect(32).order(ByteOrder.nativeOrder()).asFloatBuffer();vertices.put(new float[]{-1,-1,1,-1,-1,1,1,1}).position(0);
-        pyramid=new FixedDualGpuPyramid(Math.max(width,height)/2,vertices);
+        pyramid=new FixedDualGpuPyramid(Math.max(width,contentHeight)/2,vertices);
         GLES20.glUseProgram(program);uniform("canvasSize",0);uniform("spillFraction",ProjectionMath.INNER_SPILL_FRACTION);uniform("hingeDistanceFraction",ProjectionMath.OUTER_HINGE_DISTANCE_FRACTION);
         uniform("inner",inner?1:0);uniform("turn",0);uniform("screenDarkness",0);
+        // The canvas keeps full panel height while the task buffer ends above the gesture strip;
+        // the shader clamps sampling at that fraction and extends the bottom edge into the strip.
+        uniform("contentFraction",contentHeight>0&&contentHeight<height?(float)contentHeight/height:1f);
+        // While a fold effect animates, the band folds into the paper: no mirror, no dim.
+        uniform("bandMix",1);
+        // Desktop mode clears the gesture strip so the physical wallpaper shows through.
+        uniform("bandClear",0);
         // The original compositor's source-backed path includes the clear receiving half.
-        uniform("screenFadeActive",1);GLES20.glUniform2f(GLES20.glGetUniformLocation(program,"screen"),width,height);started=SystemClock.uptimeMillis();
+        // screen is the source buffer size: the pyramid letterbox inverse and sigma scale must
+        // match the buffer the pyramid was built from, not the taller physical canvas.
+        uniform("screenFadeActive",1);GLES20.glUniform2f(GLES20.glGetUniformLocation(program,"screen"),width,contentHeight);started=SystemClock.uptimeMillis();
     }
     private void uniform(String name,float value){GLES20.glUniform1f(GLES20.glGetUniformLocation(program,name),value);}
+    /** Desktop mode asks the shader to punch the gesture strip through to the wallpaper;
+     *  the value eases per frame so home/app switches crossfade instead of snapping. */
+    void setBandClear(boolean on){bandTarget=on?1f:0f;}
+    /** Collapses or restores the reserved strip: the task buffer grows to full canvas height
+     *  so immersive apps render edge to edge; the gesture gate itself keeps working. */
+    void resizeContent(int newHeight){
+        if(newHeight<=0||newHeight>height)return;
+        worker.post(()->{if(closed)return;contentHeight=newHeight;source.setDefaultBufferSize(width,contentHeight);
+            GLES20.glUseProgram(program);uniform("contentFraction",contentHeight<height?(float)contentHeight/height:1f);
+            GLES20.glUniform2f(GLES20.glGetUniformLocation(program,"screen"),width,contentHeight);pyramidDirty=true;});
+    }
     private final Runnable draw=new Runnable(){public void run(){
         if(closed)return;
         try{
@@ -66,6 +88,9 @@ final class FixedDualGpu implements AutoCloseable {
             float amount=ProjectionMath.onsetMotion(endpoint,entry);
             float tilt=ProjectionMath.effectTilt(eased,inner,AnimationSettings.startAngle,blocked)*amount;
             float crop=ProjectionMath.cropFraction(eased,inner,AnimationSettings.stretchPercent)*amount;
+            if(bandClear!=bandTarget){bandClear+=(bandTarget-bandClear)*.22f;if(Math.abs(bandTarget-bandClear)<.02f)bandClear=bandTarget;}
+            bandMixTarget=(tilt==0f&&crop==0f)?1f:0f;
+            if(bandMix!=bandMixTarget){bandMix+=(bandMixTarget-bandMix)*.3f;if(Math.abs(bandMixTarget-bandMix)<.02f)bandMix=bandMixTarget;}
             if(direct){
                 // Only a developing fold effect needs the shader; watch cheaply while bypassed.
                 if(tilt!=0f||crop!=0f)leaveDirect();
@@ -79,13 +104,15 @@ final class FixedDualGpu implements AutoCloseable {
                 // tilt is zero, or blurStrength is zero. Keep the old pyramid dirty:
                 // a later fold must refresh it even when the source did not change.
                 boolean needsPyramid=opacity>=.001f&&tilt!=0f&&strength>0f;
-                if(needsPyramid&&pyramidDirty){pyramid.update(external,matrix,width,height,0);pyramidDirty=false;pyramidUpdates++;}
-                if(changed||!Float.isFinite(lastTilt)||Math.abs(tilt-lastTilt)>.002f||Math.abs(crop-lastCrop)>.00001f||opacity!=lastOpacity||strength!=lastStrength){
+                if(needsPyramid&&pyramidDirty){pyramid.update(external,matrix,width,contentHeight,0);pyramidDirty=false;pyramidUpdates++;}
+                if(changed||!Float.isFinite(lastTilt)||Math.abs(tilt-lastTilt)>.002f||Math.abs(crop-lastCrop)>.00001f||opacity!=lastOpacity||strength!=lastStrength||bandClear!=lastBandClear||bandMix!=lastBandMix){
                     pyramid.bind(program,width,height);
                     GLES20.glActiveTexture(GLES20.GL_TEXTURE7);GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,external);
                     GLES20.glUniform1i(GLES20.glGetUniformLocation(program,"nativeSource"),7);
                     GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(program,"nativeTex"),1,false,matrix,0);
                     uniform("tilt",(float)Math.toRadians(tilt));uniform("crop",crop);uniform("opacity",opacity);uniform("blurStrength",strength);
+                    uniform("bandClear",bandClear);lastBandClear=bandClear;
+                    uniform("bandMix",bandMix);lastBandMix=bandMix;
                     GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4);
                     if(!EGL14.eglSwapBuffers(display,window))throw new IllegalStateException("Present failed");
                     presentedFrames++;
@@ -95,7 +122,9 @@ final class FixedDualGpu implements AutoCloseable {
             }
             // Steady identity means the shader is a plain copy; hand the TextureView straight
             // to the virtual display until a fold effect develops again.
-            if(tilt==0f&&crop==0f){if(++identityFrames>=64)goDirect();}
+            // Bypass disabled: it can fire before the virtual display exists (contentId=-1
+            // makes the surface swap a silent no-op) and steady folded state then stays black.
+            if(false&&tilt==0f&&crop==0f){if(++identityFrames>=64)goDirect();}
             else identityFrames=0;
             // Sample faster than the 8.3ms cadence of a 120Hz source, or adjacent frames merge.
             worker.postDelayed(this,4);

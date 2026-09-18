@@ -72,6 +72,11 @@ public class DuoHomeActivity extends Activity {
                 return;
             }
             if(action.endsWith(".OPEN_SEARCH")){search();return;}
+            if(action.endsWith(".OPEN_RECENTS")){
+                android.view.Display display=getDisplay();
+                if(display!=null&&display.getDisplayId()==intent.getIntExtra("display",-1))recentsSheet();
+                return;
+            }
             openShade(intent.getIntExtra("side",HomeStatusBar.SIDE_NOTIFICATIONS));
         }
     };
@@ -87,19 +92,18 @@ public class DuoHomeActivity extends Activity {
     /**
      * Sessions rebuild on fold changes; secondary homes left on stale virtual displays keep
      * those displays in "removing" forever, and MIUI then routes task restores and resumes
-     * onto the dead displays (apps never show, recents feels stuck). Finish strays early.
+     * onto the dead displays (apps never show, recents feels stuck). Only clean up when NO
+     * session exists: during startup the live set is incomplete and killing "strays" would
+     * murder the just-launched secondary home and collapse the whole session.
      */
     static void validateSecondaryHomes(){
-        Set<Integer> live=FixedDualSession.activeContentIds();
-        if(FixedDualSession.active()&&live.isEmpty())return; // still preparing: no verdict yet
+        if(FixedDualSession.active())return;
         for(DuoHomeActivity a:new ArrayList<>(homeInstances)){
             if(!(a instanceof DuoSecondaryActivity)||a.isDestroyed()||a.isFinishing())continue;
             android.view.Display display=a.getDisplay();
-            int id=display==null?-1:display.getDisplayId();
-            if(!live.contains(id)){
-                android.util.Log.i("DuoFixed","Finishing stale secondary home on display "+id+" (live="+live+")");
-                a.finish();
-            }
+            android.util.Log.i("DuoFixed","Finishing orphaned secondary home on display "
+                +(display==null?-1:display.getDisplayId())+" (no live session)");
+            a.finish();
         }
     }
     String panelStore(){return this instanceof DuoInnerActivity?"duo_inner":this instanceof DuoCoverActivity?"duo_cover":"duo_home";}
@@ -135,6 +139,7 @@ public class DuoHomeActivity extends Activity {
         IntentFilter shadeActions=new IntentFilter();
         shadeActions.addAction(getPackageName()+".OPEN_SHADE");
         shadeActions.addAction(getPackageName()+".OPEN_SEARCH");
+        shadeActions.addAction(getPackageName()+".OPEN_RECENTS");
         shadeActions.addAction(getPackageName()+".MIGRATE_SCAN");
         shadeActions.addAction(getPackageName()+".MIGRATE_APPLY");
         registerReceiver(shadeDebug,shadeActions,Context.RECEIVER_EXPORTED);
@@ -287,7 +292,10 @@ public class DuoHomeActivity extends Activity {
         setContentView(content);
         root.setOnApplyWindowInsetsListener((v,insets)->{
             Insets bars=insets.getInsets(WindowInsets.Type.systemBars()|WindowInsets.Type.displayCutout());
-            v.setPadding(bars.left+dp(wide?24:12),bars.top+dp(8),bars.right+dp(wide?24:12),bars.bottom+dp(12));return insets;
+            // Task displays run full height and the gesture gate owns the bottom strip on
+            // every panel while the dual session runs; keep the desktop content above it.
+            int band=FixedDualSession.active()?Math.round(FixedDualGestureFeedback.GESTURE_BAND_DP*density):0;
+            v.setPadding(bars.left+dp(wide?24:12),bars.top+dp(8),bars.right+dp(wide?24:12),bars.bottom+dp(12)+band);return insets;
         });
         LinearLayout header=row();header.setGravity(Gravity.CENTER_VERTICAL);
         header.setTag("home-header");
@@ -819,7 +827,8 @@ public class DuoHomeActivity extends Activity {
         }
         // Leave animation options to the system; source bounds do not grant MIUI's
         // private launcher/remote-transition integration.
-        try{getSystemService(LauncherApps.class).startMainActivity(app.component,app.user,sourceBounds,dualPanel()?ActivityOptions.makeBasic().setLaunchDisplayId(getDisplay().getDisplayId()).toBundle():null);}
+        try{getSystemService(LauncherApps.class).startMainActivity(app.component,app.user,sourceBounds,dualPanel()?ActivityOptions.makeBasic().setLaunchDisplayId(getDisplay().getDisplayId()).toBundle():null);
+        noteRecent(key);}
         catch(RuntimeException e){message("系统未能打开这个应用");}}
     private void appInfo(String key){HomeApps.App app=apps.get(key);if(app==null)return;
         try{getSystemService(LauncherApps.class).startAppDetailsActivity(app.component,app.user,null,null);}catch(RuntimeException e){message("无法打开应用信息");}}
@@ -845,6 +854,65 @@ public class DuoHomeActivity extends Activity {
     }catch(RuntimeException e){message("请在系统设置中选择默认桌面");}}
     void show(Dialog dialog){dialogs.removeIf(d->!d.isShowing());dialogs.add(dialog);dialog.show();}
     void message(String value){Toast.makeText(this,value,Toast.LENGTH_LONG).show();}
+    /** Display-scoped task switcher replacing MIUI recents on virtual panels. */
+    static final LinkedHashMap<String,Boolean> recentsLru=new LinkedHashMap<>(){
+        @Override protected boolean removeEldestEntry(Map.Entry<String,Boolean> eldest){return size()>8;}
+    };
+    private static void noteRecent(String key){synchronized(recentsLru){recentsLru.remove(key);recentsLru.put(key,Boolean.TRUE);}}
+    HomeSheet recentsSheet(){
+        List<String> keys=new ArrayList<>();
+        synchronized(recentsLru){keys.addAll(recentsLru.keySet());}
+        java.util.Collections.reverse(keys);
+        // Same fullscreen borderless blur base as the opened folder; cards stack on top.
+        HomeSheet dialog=new HomeSheet(this,420,500,false,true);
+        dialog.header("最近任务");
+        if(keys.isEmpty()){
+            TextView empty=text("还没有从桌面打开过的应用",15,MUTED);empty.setGravity(Gravity.CENTER);empty.setPadding(dp(12),dp(48),dp(12),dp(12));
+            dialog.content.addView(empty);
+        }else{
+            HomePager cards=new HomePager(this);cards.setTag("home-recents-pager");
+            cards.setOffscreenPageLimit(2);
+            cards.setPageMargin(-dp(280));
+            cards.setPageTransformer(false,(page,position)->{
+                float factor=1-Math.min(1f,Math.abs(position))*0.12f;
+                page.setScaleX(factor);page.setScaleY(factor);
+                page.setAlpha(1f-Math.min(1f,Math.abs(position))*0.25f);
+            });
+            cards.setAdapter(new PagerAdapter(){
+                @Override public int getCount(){return keys.size();}
+                @Override public boolean isViewFromObject(View view,Object item){return view==item;}
+                @Override public Object instantiateItem(ViewGroup container,int position){
+                    FrameLayout page=new FrameLayout(DuoHomeActivity.this);
+                    page.addView(recentsCard(keys.get(position)));
+                    container.addView(page);return page;
+                }
+                @Override public void destroyItem(ViewGroup container,int position,Object page){container.removeView((View)page);}
+            });
+            dialog.content.addView(cards,new LinearLayout.LayoutParams(-1,0,1));
+            blankTapCloses(cards,dialog);
+        }
+        show(dialog);return dialog;
+    }
+    /** A paper-stack card for the display-scoped task switcher. */
+    private View recentsCard(String key){
+        FrameLayout page=new FrameLayout(this);
+        LinearLayout card=column();card.setGravity(Gravity.CENTER);
+        FrameLayout.LayoutParams size=new FrameLayout.LayoutParams(dp(240),dp(340),Gravity.CENTER);
+        page.addView(card,size);
+        HomeStyle.glass(card,30,HomeStyle.ROLE_CARD);
+        HomeApps.App app=apps.get(key);
+        ImageView image=icon(key);image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        card.addView(image,new LinearLayout.LayoutParams(dp(96),dp(96)));
+        TextView name=text(app==null?key:app.label,20,TEXT);name.setGravity(Gravity.CENTER);name.setSingleLine(true);
+        name.setEllipsize(TextUtils.TruncateAt.END);name.setPadding(dp(10),dp(18),dp(10),dp(4));
+        card.addView(name,new LinearLayout.LayoutParams(-1,-2));
+        TextView detail=text(app==null?"":appPlacement(app),12,MUTED);detail.setGravity(Gravity.CENTER);
+        detail.setSingleLine(true);detail.setEllipsize(TextUtils.TruncateAt.END);
+        card.addView(detail,new LinearLayout.LayoutParams(-1,-2));
+        card.setOnClickListener(v->{launch(key,image);dismissSheets();});
+        return page;
+    }
+    private void dismissSheets(){for(Dialog d:new ArrayList<>(dialogs))if(d.isShowing())d.dismiss();}
     private LinearLayout column(){LinearLayout v=new LinearLayout(this);v.setOrientation(LinearLayout.VERTICAL);return v;}
     private LinearLayout row(){LinearLayout v=new LinearLayout(this);v.setOrientation(LinearLayout.HORIZONTAL);return v;}
     private TextView text(String value,int size,int color){return HomeStyle.text(this,value,size,color);}

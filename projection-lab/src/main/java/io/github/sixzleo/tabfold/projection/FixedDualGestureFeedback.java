@@ -8,6 +8,10 @@ import android.animation.ValueAnimator;
 
 /** Uses the existing navigation recognizer and visual/haptic feedback on each physical output. */
 final class FixedDualGestureFeedback extends View {
+    /** Bottom strip reserved for the gesture pill; content displays end above it. */
+    static final float GESTURE_BAND_DP=20f;
+    /** Resting pill centre sits this many dp above the panel's bottom edge. */
+    static final float PILL_BOTTOM_DP=6f;
     private final NavigationGestureGate gate=new NavigationGestureGate();
     private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Handler main=new Handler(Looper.getMainLooper());
@@ -17,15 +21,18 @@ final class FixedDualGestureFeedback extends View {
     private boolean tracking,triggered;
     private float progress;
     private float touchY;
+    private boolean pillVisible=true;
+    private boolean pillDark;
     private boolean swallowing;
     private ValueAnimator retract;
+    private boolean loggedDraw;
     private final Runnable hold=()->{if(tracking&&!triggered&&gate.recentsReady(SystemClock.uptimeMillis(),dp(62),430)){triggered=true;commit(NavigationGestureGate.Action.RECENTS);}};
     FixedDualGestureFeedback(Context context,int density,java.util.function.IntConsumer action){super(context);this.density=density/160f;this.action=action;setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);}
     private float dp(float n){return n*density;}
     boolean touch(MotionEvent event,boolean desktop){
         int type=event.getActionMasked();float x=event.getX(),y=event.getY();
         if(type==MotionEvent.ACTION_DOWN){
-            cancel();touchY=y;origin=y>getHeight()-dp(28)?NavigationGestureGate.Origin.BOTTOM:y<dp(48)?null:!desktop&&x<dp(22)?NavigationGestureGate.Origin.LEFT:!desktop&&x>getWidth()-dp(22)?NavigationGestureGate.Origin.RIGHT:null;
+            cancel();touchY=y;origin=y>getHeight()-dp(GESTURE_BAND_DP)?NavigationGestureGate.Origin.BOTTOM:y<dp(48)?null:!desktop&&x<dp(22)?NavigationGestureGate.Origin.LEFT:!desktop&&x>getWidth()-dp(22)?NavigationGestureGate.Origin.RIGHT:null;
             if(origin==null)return false;tracking=true;gate.down(origin,x,y,event.getEventTime());
             if(origin==NavigationGestureGate.Origin.BOTTOM)main.postDelayed(hold,430);return true;
         }
@@ -50,12 +57,22 @@ final class FixedDualGestureFeedback extends View {
         retract.addUpdateListener(a->{progress=(Float)a.getAnimatedValue();invalidate();});retract.start();
     }
     void cancel(){if(retract!=null){retract.cancel();retract=null;}main.removeCallbacks(hold);gate.reset();tracking=false;swallowing=false;triggered=false;progress=0;invalidate();}
+    /** Hides the resting/active pill while an immersive app fills the panel; the gate still works. */
+    void setPillVisible(boolean on){if(pillVisible!=on){pillVisible=on;invalidate();}}
+    /** The GL strip probe flips the pill dark on light backgrounds; hysteresis avoids flicker. */
+    void setPillLuminance(float lum){
+        boolean dark=pillDark?lum>.55f:lum>.70f;
+        if(dark!=pillDark){pillDark=dark;invalidate();android.util.Log.i("DuoBand","pill "+(dark?"dark":"light")+" lum="+lum);}
+    }
     @Override protected void onDetachedFromWindow(){cancel();super.onDetachedFromWindow();}
     @Override protected void onDraw(Canvas canvas){
+        if(!loggedDraw){loggedDraw=true;android.util.Log.i("DuoBand","draw "+getWidth()+"x"+getHeight()+" pill="+pillVisible+" prog="+progress);}
+        paint.setColor(pillDark?Color.BLACK:Color.WHITE);
+        if(pillVisible&&(origin==NavigationGestureGate.Origin.BOTTOM||progress<=0)){
+            // A faint resting pill marks the reserved strip; a gesture grows it in place.
+            paint.setStyle(Paint.Style.FILL);paint.setAlpha((int)(130+100*progress));float w=dp(92+28*progress),h=dp(4+2*progress),cy=getHeight()-dp(PILL_BOTTOM_DP+2*progress);canvas.drawRoundRect(getWidth()/2f-w/2,cy-h/2,getWidth()/2f+w/2,cy+h/2,h/2,h/2,paint);}
         if(progress<=0)return;
-        paint.setColor(Color.WHITE);
-        if(origin==NavigationGestureGate.Origin.BOTTOM){paint.setStyle(Paint.Style.FILL);paint.setAlpha((int)(130+100*progress));float w=dp(92+28*progress),h=dp(4+2*progress),cy=getHeight()-dp(7+8*progress);canvas.drawRoundRect(getWidth()/2f-w/2,cy-h/2,getWidth()/2f+w/2,cy+h/2,h/2,h/2,paint);}
-        else{
+        if(origin!=NavigationGestureGate.Origin.BOTTOM){
             boolean left=origin==NavigationGestureGate.Origin.LEFT;
             float extent=dp(38)*progress,half=dp(66+18*progress);
             float cy=Math.max(half,Math.min(getHeight()-half,touchY));

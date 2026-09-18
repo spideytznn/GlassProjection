@@ -578,15 +578,20 @@ public final class ProjectionService extends AccessibilityService implements Sen
         recentsVisible();
         appScopeDirty=true;update();
     }
-    private long lastDualRecentsHome;
+    private long lastDualRecentsHome,lastDualRecentsScan;
     /**
      * MIUI recents on a virtual display cannot return home by itself: after clearing all
      * tasks it keeps an empty "no recent items" page instead of dismissing. Watch for that
      * text and send the HOME key to that display, which relaunches the secondary home.
+     * Scoped hard: one tree walk max every 3s, only on MIUI-home window-state changes —
+     * scanning on every content-changed event stalled the main thread and input-ANR'd us.
      */
     private void checkDualRecentsEmpty(AccessibilityEvent e){
-        if(e!=null&&e.getEventType()!=AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-            &&e.getEventType()!=AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)return;
+        if(e==null||e.getEventType()!=AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED)return;
+        if(!"com.miui.home".contentEquals(e.getPackageName()==null?"":e.getPackageName()))return;
+        long now=SystemClock.uptimeMillis();
+        if(now-lastDualRecentsScan<3000)return;
+        lastDualRecentsScan=now;
         for(AccessibilityWindowInfo w:getWindows()){
             if(w.getType()!=AccessibilityWindowInfo.TYPE_APPLICATION||!w.isActive())continue;
             AccessibilityNodeInfo root=w.getRoot();if(root==null)continue;

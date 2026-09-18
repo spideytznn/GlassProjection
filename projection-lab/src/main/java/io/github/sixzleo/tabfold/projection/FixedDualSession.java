@@ -23,6 +23,13 @@ final class FixedDualSession {
     private float angle=Float.NaN;
     private static long nextStart;
     static boolean active(){return current!=null;}
+    /** True while this session draws an independent output over that physical display. */
+    static boolean outputOn(int displayId){
+        FixedDualSession s=current;
+        if(s==null)return false;
+        for(FixedDualOutput o:s.outputs)if(o.physicalId==displayId)return true;
+        return false;
+    }
     /** Display ids of this session's live content surfaces; empty while starting or after close. */
     static Set<Integer> activeContentIds(){
         FixedDualSession s=current;
@@ -31,12 +38,20 @@ final class FixedDualSession {
         for(FixedDualOutput o:s.outputs)if(o.contentId>=0)ids.add(o.contentId);
         return ids;
     }
+    /** Virtual content display mirroring a physical panel; -1 when unknown. */
+    static int contentIdForPhysical(int physicalId){
+        FixedDualSession s=current;
+        if(s==null)return -1;
+        for(FixedDualOutput o:s.outputs)if(o.physicalId==physicalId&&o.contentId>=0)return o.contentId;
+        return -1;
+    }
     /** Fixed dual is the one advertised desktop mode; the legacy single-screen pipeline stays dormant unless disabled via adb. */
     static boolean enabled(android.content.Context c){return c.getSharedPreferences("duo_dual",0).getBoolean("enabled",true);}
     static void setEnabled(android.content.Context c,boolean enabled){c.getSharedPreferences("duo_dual",0).edit().putBoolean("enabled",enabled).apply();if(enabled)start(ProjectionService.instance);else stop();}
     private static long ownHomeSince;
     static void maintain(ProjectionService service){
         DuoHomeActivity.validateSecondaryHomes();
+        if(nextStart==0)nextStart=SystemClock.uptimeMillis()+8000; // let a predecessor's death-release of the display topology settle before the first flip
         boolean ownHome=service.getSystemService(android.app.role.RoleManager.class).isRoleHeld(android.app.role.RoleManager.ROLE_HOME);
         if(!ownHome){ownHomeSince=0;stop();return;}
         if(ownHomeSince==0)ownHomeSince=SystemClock.uptimeMillis();
@@ -54,12 +69,33 @@ final class FixedDualSession {
         current=new FixedDualSession(service);current.begin();
     }
     static void stop(){if(current!=null)current.close();}
+    /** ADB experiment hook: collapse or restore one output's gesture strip in place. */
+    static String setBand(int displayId,boolean reserve){
+        FixedDualSession s=current;if(s==null)return "ERROR no session";
+        final Object[] result={"ERROR display not found"};
+        final java.util.concurrent.CountDownLatch done=new java.util.concurrent.CountDownLatch(1);
+        s.main.post(()->{try{for(FixedDualOutput o:s.outputs)if(o.contentId==displayId){o.setBandReserved(reserve);result[0]="OK band "+(reserve?"reserved":"collapsed");break;}}finally{done.countDown();}});
+        try{done.await(2,java.util.concurrent.TimeUnit.SECONDS);}catch(InterruptedException ignored){}
+        return (String)result[0];
+    }
     private FixedDualSession(ProjectionService service){this.service=service;primary=identity(service.getSystemService(DisplayManager.class).getDisplay(0));policy=new FixedDualPolicy(primary.equals("local:4639175402683733248"));}
     private static String identity(Display display){try{return (String)org.lsposed.hiddenapibypass.HiddenApiBypass.invoke(Display.class,display,"getUniqueId");}catch(Exception e){return "";}}
     private void begin(){
         status="preparing";main.postDelayed(()->{if(outputs.size()!=2||outputs.stream().anyMatch(o->o.contentId<0))fail("双屏内容准备超时");},15000);
+        // The Choreographer frame loop dies with vsync when the panel sleeps, so its
+        // keyguard check never runs and the opaque overlays plus fixed topology would trap
+        // the lock screen's input. Close on the broadcast instead; maintain() re-arms later.
+        try{
+            android.content.IntentFilter screen=new android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF);
+            service.registerReceiver(screenEvents,screen);
+        }catch(RuntimeException ignored){}
         MobileHelper.fixedDualState(policy.requestedState(),result->{if(closed)return;if(!result.startsWith("OK")){fail(result);return;}readyUntil=SystemClock.uptimeMillis()+3000;pollContact();prepare();});
     }
+    private final android.content.BroadcastReceiver screenEvents=new android.content.BroadcastReceiver(){
+        @Override public void onReceive(android.content.Context context,android.content.Intent intent){
+            if(android.content.Intent.ACTION_SCREEN_OFF.equals(intent.getAction()))stop();
+        }
+    };
     private void pollContact(){
         if(closed)return;
         MobileHelper.dualContact(sample->{if(closed)return;
@@ -131,8 +167,10 @@ final class FixedDualSession {
     void fail(String reason){status="ERROR "+reason;android.util.Log.e("DuoFixed",status);close();}
     private void close(){
         if(closed)return;closed=true;main.removeCallbacksAndMessages(null);Choreographer.getInstance().removeFrameCallback(frame);
+        try{service.unregisterReceiver(screenEvents);}catch(RuntimeException ignored){}
         for(FixedDualOutput output:outputs)output.close();outputs.clear();
-        DuoHomeActivity.validateSecondaryHomes();
-        MobileHelper.fixedDualState(-1,result->{if(current==this)current=null;if(!status.startsWith("ERROR"))status="stopped; "+result;});
+        MobileHelper.fixedDualState(-1,result->{
+            if(current==this){current=null;DuoHomeActivity.validateSecondaryHomes();}
+            if(!status.startsWith("ERROR"))status="stopped; "+result;});
     }
 }

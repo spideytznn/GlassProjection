@@ -65,7 +65,7 @@ import java.util.function.Consumer;
 final class HomeControlPanel {
     // Glass materials: dock-tinted translucency with a bottom fade instead of a solid edge.
     private static final int TEXT=0xfff2f2f7, MUTED=0x99ebebf5, BLUE=0xff0a84ff;
-    private static final int PANEL_TINT=0xff121b1f, MODULE=0x42787880, CARD=0x463a3a44;
+    static final int PANEL_TINT=0xff121b1f, MODULE=0x42787880, CARD=0x463a3a44;
     private static final int TORCH_ON=0xfff2f2f7, TORCH_GLYPH=0xff16161c, INDIGO=0xff5e5ce6;
     private static final Typeface MEDIUM=Typeface.create("sans-serif-medium",Typeface.NORMAL);
 
@@ -195,7 +195,7 @@ final class HomeControlPanel {
                 default:return true;
             }
         });
-        panel.addView(handle,new LinearLayout.LayoutParams(-1,dp(52)));
+        panel.addView(handle,new LinearLayout.LayoutParams(-1,dp(40)));
         root=new FrameLayout(wc);
         root.setOnClickListener(v->close());
         root.addView(scrim,new FrameLayout.LayoutParams(-1,-1));
@@ -309,6 +309,16 @@ final class HomeControlPanel {
         HomeControlPanel panel=currentByDisplay.get(displayId);
         if(panel!=null&&panel.attached)panel.close();
     }
+    /** True when the shade on that display is sheet-sized to the screen bottom; the dual
+     *  output then extends the sheet over the reserved gesture band (the pill stands down). */
+    static boolean bottomCovered(int displayId){
+        HomeControlPanel panel=currentByDisplay.get(displayId);
+        return panel!=null&&panel.bottomCovered();
+    }
+    private boolean bottomCovered(){
+        int full=root.getHeight();
+        return !closed&&attached&&full>0&&panel.getHeight()>=full-dp(28);
+    }
     private void destroy(){
         if(closed)return;closed=true;attached=false;
         setTorchListening(false);DuoNotifications.forget(change);
@@ -403,7 +413,7 @@ final class HomeControlPanel {
         notifList.addView(notifBox,new ViewGroup.LayoutParams(-1,-2));
         LinearLayout.LayoutParams listSize=new LinearLayout.LayoutParams(-1,0,1f);
         // Keep a modest glass grab-zone below the list (~4.5 cards visible).
-        listSize.bottomMargin=dp(52);
+        listSize.bottomMargin=dp(36);
         target.addView(notifList,listSize);
         refreshNotifications();
     }
@@ -675,7 +685,13 @@ final class HomeControlPanel {
         text.setMaxLines(2);text.setEllipsize(TextUtils.TruncateAt.END);
         labels.addView(text,new LinearLayout.LayoutParams(-1,-2));
         card.addView(labels,new LinearLayout.LayoutParams(0,-2,1));
-        card.setOnClickListener(v->{if(item.open(service))close();});
+        card.setOnClickListener(v->{
+            // Launch onto the VIRTUAL content display the desktop lives on; the physical
+            // panel this shade covers would leave the app hidden behind our own overlay.
+            int physical=display==null?-1:display.getDisplayId();
+            int content=FixedDualSession.active()?FixedDualSession.contentIdForPhysical(physical):physical;
+            if(item.open(service,content))close();
+        });
         card.setOnLongClickListener(v->{DuoNotifications.cancel(item.key);return true;});
         return card;
     }
