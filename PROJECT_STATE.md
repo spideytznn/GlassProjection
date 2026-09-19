@@ -186,6 +186,46 @@
 - 关键结论：widget 绑定链路与本项目 HomeWidgets 几乎一致（bindIfAllowed+系统弹窗，无静默绑定）；多出可借鉴点 = pending widget 四元组中断恢复、`widgetFeatures` 判 configure、**负数 slot 内置伪 widget（时钟/天气/日历自绘，绕开 MIUI 私有 provider）**、span 优先 targetCellWidth/Height、HostView 缩放包装+可交互子 View 命中拦截；文件夹 = `folder:<uuid>` 格位占位 + 独立 folders 列表、拖拽重叠合并热区公式 min(cellW*0.82, 1.35*iconSize)、打开面板 3×3 分页玻璃浮层、预置自动分类夹（固定 UUID+包名候选+≥2 才建）。
 - **第二轮（--show-bad-code 重反编译到 `参考/miduo-simple/`，skipped 全清零）已补齐**：图标预览确认 2×2 取前 4（成员 38% 尺寸、背景圆角 24%、Control 玻璃）；**剩 1 个成员自动解散、末位 app 回填文件夹原格位**；格位移动"挤开不交换"（widget 格不可推、桌面/dock 互斥）；落点权重 folder=3>widget=2>格=1、删除区最先；DuoGlass 九角色参数表（blur/noise/elevation/pressedScale，含深色与按下修正）；图标两级缓存（磁盘只存元数据+占位图标，扫完换真图）+ Collator 本地化排序。详见 `参考/MiDuo-实现分析.md` 第三、四节。
 
+
+## 追加：test-base-state 一夜实证（2026-09-17 深夜，分支已删，结论归档于此）
+
+- **物理折合 PoC ✓**：hold `state 5` 下真折全程 committed 锁 5、双面板零断电、override 跨完整折合周期存活（无需 re-arm）；base（铰链姿态）照常更新。
+- **hold-from-closed ✓**：折合态 hold 5 → display 0 立即重绑内屏 + 双亮 = 「开盖前预点亮内屏」，规格②③④机制全通（预挂帧+hold+端点淡出+真实截图冻结帧，外屏挂载走 SCVH+attachAccessibilityOverlayToDisplay，FLAG_PRESENTATION 置位）。
+- **规格⑤（合拢换绑零黑）固件层无解 ✗**：CLOSED 提交必令外屏 ~0.5s committedState=OFF（=黑）；`set-user-preferred-display-mode` 预设 120Hz 不能消除。三星无此问题因有 CONCURRENT_OUTER_DEFAULT（零换绑），小米状态表无此状态。
+- **路线决策：走 FixedDualSession**（合拢不释放，外屏跑 display 0 实时镜像（mirror-lease 通道现成）+ 触摸注入（覆盖帧收触摸→a11y dispatchGesture 注回 display 0）；系统接管只在灭屏时发生）。
+- 编排实现细节（若重建参考 test-base-state reflog：EarlyDisplayModel 双屏模型/premount 门控/rearm 滞回/stall 锁存；EarlyDisplayHelper.prepareTransition 模式预设+截图；DualCover 双帧挂载）。
+- 运维坑：force-stop 应用会经 provider 死亡连带杀 shell controller；prefs 文件是 animation_settings.xml；HyperOS force-stop 后无障碍不自动重绑需 toggle。
+
+## 调研：bunkaich/Folduo 开合不黑屏原理（2026-09-17，Z Fold7 实验项目）
+
+- **核心 = 绕过系统原生切换**：Shizuku(shell UID) UserService 里反射调 `DeviceStateManager.requestState()` 常驻三星固件私有状态 `CONCURRENT_INNER_DEFAULT`/`CONCURRENT_OUTER_DEFAULT`（按状态名+property 10/11/12 筛选），两块面板同时保持逻辑点亮，系统"折起→灭一块屏"路径整个不发生；三星合盖会自动取消 override → DisplayListener 发现面板消失后自动 re-arm。
+- **顺序化过渡（任一时刻两屏都有不透明像素）**：截源屏（反射 `IWindowManager.captureDisplay`，`setExcludeLayers` 排除自己的覆盖层防自递归）→ 源屏盖不透明快照（SurfaceView 帧提交回调确认 committed）→ **先**给目标屏盖内侧右半裁剪映射帧 → 才 `startActivityFromRecents + setLaunchDisplayId` 移任务（裸 reparent 在 Fold7 不重绘）→ 32ms 轮询 `dumpsys window visible-apps` 到 HAS_DRAWN（1800ms 超时）→ 截目标屏真实帧替换 → 180ms 淡出。角度阈值：滞回 12°，端点 ≥176°/≤1° 稳定 120ms。
+- **角度三源**：公开 TYPE_HINGE_ANGLE 只有 0/90/180 粗值；细粒度靠三星私有传感器(type 65686)或 hack：对三星互动壁纸 `WallpaperManager.sendWallpaperCommand("<pkg>.READ_ANGLE")`，壁纸把 mCurrentAngle 打进 logcat，shell 侧 `logcat -s SprWallpaper|FoldInteractive` 正则抽值。
+- **渲染**：每屏一个 TYPE_APPLICATION_OVERLAY + AGSL RuntimeShader，CPU 6 级高斯金字塔按方差插值连续模糊；外屏混入内侧快照做"磨砂透视"，输出 alpha 恒 1（不透明）。其姿态/投影类恰好也叫 `GlassProjection.java`（本项目同名由来）。
+- **对我们的启示**：CONCURRENT_* 是三星固件私有，HyperOS 无此状态，"开合不黑"在小米上不能照搬 DeviceStateManager 路线（我们的 FixedDualSession 投屏路线是替代方案）；可搬的是**过渡顺序纪律**（先盖后移、帧提交确认、HAS_DRAWN 轮询、淡出收尾）与滞回阈值设计。
+- 源码副本：`C:\Users\spideytznn\AppData\Local\Temp\folduo\`（16 文件）。
+
+### 追加：小米等价接口已实测找到（2026-09-17，本机 lhasa 实证）
+
+- **`OPENED_PRESENTATION`(id 5) / `OPENED_REVERSE_PRESENTATION`(id 6) = 小米版 CONCURRENT**。`adb shell cmd device_state print-states` 全表：0 CLOSED / 1 TENT / 2 HALF_OPENED / 3 OPENED / 4 OPENED_REVERSE / 5 OPENED_PRESENTATION / 6 OPENED_REVERSE_PRESENTATION。
+- **触发比三星更容易**：Android 17 自带 `cmd device_state state <id>` / `state reset`（emulated 覆盖，shell 权限即可，无需反射）。**实测 `cmd device_state state 5` 后 dumpsys display 外屏 Display 1 从 `state OFF` → `state ON, committedState ON`（两屏同亮）；`state reset` 恢复**。
+- 架构差异（利好）：本机内外屏**常驻注册为两个稳定逻辑 Display**（0=内屏 1672×2364、1=外屏 1168×1712，均 INTERNAL + FLAG_ALLOWED_TO_BE_DEFAULT_DISPLAY），无三星"物理↔逻辑 ID 互换"坑；我们应用（uid 10279）在 display 1 上本就有帧率投票。
+- 待验证（下一步 PoC）：① OPENED_PRESENTATION 下系统在外屏显示什么、Presentation/Activity 放 display 1 是否正常；② override 与系统自身状态请求的竞争（Override Request 全局排他）、物理折合时 emulated override 的行为与 re-arm 时机；③ 开合全程 hold→reset 的黑屏时序。
+- **明日 PoC（新分支 `test-base-state`，自 origin/main@18489f3 建，未切换，不并 duo-ui）**：
+  1. **真机物理折合验证**（核心未知项）：hold `cmd device_state state 5` 后实折，看 vendor/HAL 是否遵守 committed override（外屏是否保持 ON）；再实开验证反向。
+  2. Shizuku UserService 通道跑 `cmd device_state state 5 / reset`（确认 shell 经 Shizuku 与 adb 同效）。
+  3. hold 期间在外屏（display 1）挂 Presentation/Activity 画内容，验证 swap 瞬间窗口去向（预期掉到内屏）。
+  4. 我们做 HOME 的接管测速：释放后 DuoHome 在新 display 0 画首帧耗时（对比抖音 splash 秒级）。
+  5. 角度源确认：本机 TYPE_HINGE_ANGLE 细粒度分辨率（对照 Folduo 的 0/90/180 问题）。
+- 本机 adb 端口已变为 `192.168.31.51:40421`（旧 35473 失效）。
+
+### 追加 2：切主屏黑屏时序实测（2026-09-17，base-state 仿真合盖）
+
+- **实验方法**：`cmd device_state base-state 0` 仿真合盖（框架层等价物理折合，可逆 `reset`），`screencap -a`（注意：`-d` 参数要物理 display id，见 `dumpsys SurfaceFlinger --display-id`）逐相位取证，截图在 `build/tmp/e1_*.png/e2_*.png/e3_*.png`。
+- **相位结果**：① hold `state 5` → 两屏 ON，**外屏点亮但纯黑**（presentation 空画布，系统不画任何东西，内容权完全归我们）；② hold 中合盖 → committed 保持 5，**切换被完全屏蔽**，两屏稳定 ON 无任何电源事件；③ 释放 `state reset` → committed→0，系统执行真切换：内屏 OFF、外屏接管，**外屏电源连续（无 OFF→ON 闪烁）**；4s 后外屏完整渲染出前台 app（抖音消息页+状态栏，activity 走了 splash 重启）。
+- **小米也是 swap 模型**：释放后 screencap 后缀尺寸翻转（_0 变 1168×1712、_1 变 1672×2364）——合盖时 display 0 从内屏重绑到外屏，与三星 mapper 同类。**挂逻辑 display 1 的 Presentation 在 swap 瞬间会掉到内屏**（Folduo 的避坑点在小米同样存在）。
+- **结论**：面板电源层"切主屏黑一下"已被消除（外屏接管前就点亮且不断电）；剩余的是**内容交接空窗**——display 0 重绑后真实 app/launcher 需在新主屏 resume/重排才有画面，裸跑会看到这段黑。对策：① 我们做 HOME，DuoHome 进程常驻，swap 后第一时间在 display 0 画第一帧（比冷启动快一个量级）；② 可配合截图覆盖 + HAS_DRAWN 后淡出（Folduo 纪律）；③ 真机物理折合路径未验证——vendor 折叠服务/HAL 是否也遵守 committed override 未知，需实折 PoC。
+
 ## 迁移引擎现状（第二十一轮，HomeMigrator）
 
 - **SCAN 端到端通过**：`am broadcast -a <pkg>.MIGRATE_SCAN`（需 MIUI 桌面前台+我们的 activity 存活注册接收者）。流程：逐页扫描 a11y 树 → 空页（仅 dock）停止 → HOME 回第一页 → 逐个打开文件夹读内容 → 行协议输出到 logcat（SCAN_BEGIN…SCAN_END 分块）。

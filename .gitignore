@@ -22,3 +22,6 @@ dist/
 参考/miduo-decompiled/
 参考/miduo-simple/
 参考/*.apk
+.mimosa/
+.v2c/
+.video_agent/
