@@ -426,7 +426,13 @@ public final class ProjectionService extends AccessibilityService implements Sen
         if(updateSuspended)return;
         try{updateState();}finally{
             signalRenderer();main.removeCallbacks(tick);
-            if(connected)main.postDelayed(tick,ProjectionCadence.delay(standby,foldPose.blocksProjection(),screenFadeActive,coverToken,pending,homeUncertain));
+            long cadence=ProjectionCadence.delay(standby,foldPose.blocksProjection(),screenFadeActive,coverToken,pending,homeUncertain);
+            // The fixed-dual branch of updateState() only re-checks power state and lets
+            // maintain() keep the session alive; ticking it at 40ms keeps synchronous
+            // binder calls landing on the main thread 25x/s and starves every window the
+            // process renders (launcher on both virtual displays included).
+            if(FixedDualSession.active())cadence=Math.max(cadence,500);
+            if(connected)main.postDelayed(tick,cadence);
         }
     }
     private void updateState() {

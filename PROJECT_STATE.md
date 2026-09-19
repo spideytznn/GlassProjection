@@ -1,8 +1,130 @@
 # PROJECT_STATE
 
-- 日期：2026-09-18
+- 日期：2026-09-20
 - 分支：duo-ui-preview
-- 本阶段：**小白条独立占位（底部 28dp 手势带不再与应用内容重叠）**；已离线构建并过"删 APK 重建 + dex 标记 + 时间戳"三件套，已装机冒烟通过（见"小白条独立占位"节）；全部改动未提交 git
+- 本阶段：**全部下拉实验回退，恢复自制 HyperOS 控制中心**（用户拍板新方向：**单虚拟屏架构**，方案见 docs/单虚拟屏架构方案.md，明天公司继续）（用户准备推翻重置；NativeShade/MirrorShade/镜像 VD 通道/AIDL/编排残留全部移除，HomeControlPanel 接线恢复）；全部改动未提交 git
+
+## 下拉实验全线回退（2026-09-20 上午，tools/revert_shade.py）
+
+- **回退到"注释掉自制下拉框之前"**：ProjectionService.updateShadeBar 恢复 HomeControlPanel.beginDrag/dragOn/releaseOn 三行接线；删除 NativeShade.java、MirrorShade.java；移除 setNativeShade 三件套、outputForContent、sessionEnded、provider 的 mirror-mode/mirror-shade-test、AIDL createMirrorContent/releaseMirrorContent、FixedDualContentHost 的 createMirror/releaseMirror/id-0 注入放开、MobileHelperHost 的会话内 5↔6 直切（恢复"cannot change during a session"）。
+- **装机验证**：会话 running（state 6 封面为主，灭屏后唤醒自动恢复）、封面下拉出自制面板（custom_cc_back.png：双卡+媒体+竖滑条+3×4 开关格完整）。
+- **今天全天实验结论存档**（推翻重置时可参考）：① 原生下拉只在 display 0 存在；② 我们的 a11y 覆盖窗(311000)在 SystemUI(151000) 之上，主屏原生面板必须撤出才可见；③ 5↔6 换主屏在 composer 层硬清一帧，任何应用侧遮罩都盖不住；④ 无 OWN_CONTENT_ONLY 的 VD 可实时镜像 display 0（DisplayManager 保比例，buffer 必须与 VD 同尺寸）；⑤ INVISIBLE 的 TextureView 不分配 surface（等首帧要用 alpha=0）；⑥ shell input 能唤原生面板，a11y dispatchGesture 不能。（下拉→全屏镜像 display 0 遮罩+注入开真面板+触摸回注，远程全闭环验证）+ 回退到 DuoHome 双虚拟屏架构；全部改动未提交 git
+
+## MirrorShade：非主屏的原生下拉（2026-09-20 上午）
+
+- **问题**：原生下拉只存在于 display 0（主屏），固定持一个 state 意味着只有一块屏能下拉（另一块屏 NativeShade 拒绝）；换主屏又会 composer 级闪黑。"抄小米原版"不可行——那是 SystemUI 进程内特权实现（单屏设计），不能在我们进程里跑。
+- **方案**：非主屏下拉触发（NativeShade 检测 physicalId!=0 时路由到新类 `MirrorShade`）→ 在该面板盖全屏 a11y 遮罩窗（黑底+居中 letterbox TextureView）→ helper `createMirrorContent` 建 display 0 全尺寸镜像 VD 喂 TextureView → `svc input swipe` 注入下拉到 display 0（真原生面板打开）→ 遮罩触摸经 letterbox 逆映射 `dualTouch(0,…)` 回注 → 350ms watch 检测 display 0 大 systemui 窗口消失即关（grace/重试同 NativeShade）→ `releaseMirrorContent` 释放 VD（新 AIDL=16，FixedDualContentHost.releaseMirror）+ 移除窗。用户看到/操作的是真原生面板（1 帧延迟），DuoHome 在下面等着。
+- **验证（折叠态远程）**：provider 调试钩子 **mirror-shade-test** 触发 → open panel 1 → pull OK → mirror VD 368 (1168x1712) → 内屏截图见原生通知面板（mirror_shade2.png，居中 letterbox：内屏 0.707 vs 源 0.682 上下满左右窄边）→ BACK → "shade dismissed" → VD 释放干净（display-id 列表无残留）。
+- **待办**：真手指体验（展开态在内屏下拉）待用户验证；注入 x=86% 开通知侧 vs 控制侧的左右判定问题仍在；letterbox 边缘触摸已被忽略（越界门）；深色模式不重绘/小米互传包名两个桌面侧老 bug 未修。（用户拍板：镜像换主屏方案因 composer 级闪黑放弃，Duo 桌面仍是主线；NativeShade 实验保留活跃）；见"镜像架构回退"节；全部改动未提交 git
+
+## 镜像架构回退（2026-09-20 上午，本地未提交）
+
+- **回退原因**：5↔6 会话内换主屏实测仍有瞬时黑屏（双冻结帧遮罩也盖不住——换绑发生在 composer 层，我们的遮罩窗同管线被一起清）。用户决定回到"DuDuoHome 桌面"主线（即'一直镜像'提议前的工作形态）。
+- **回退方式**：外科手术式（全部未提交+另一会话改动混在同一工作树，不能 git 回退）：FixedDualOutput 撤掉 mirror/pane/crop/snapshot 全部恢复原版（保留 setNativeShade 三件套）；FixedDualGpu 撤掉 plain/cropRight/buffer 分离；FixedDualSession 撤掉 mirrorMode/单输出/换向编排（switchTo/FreezeMask 全删），保留 outputForContent（NativeShade 依赖）。回退脚本 tools/revert_mirror.py、revert_session.py 留档。
+- **保留未撤（休眠可用）**：IHelperHost.createMirrorContent AIDL + FixedDualContentHost.createMirror（无 OWN_CONTENT_ONLY 镜像 VD）+ id-0 注入放开 + helper 会话内 5↔6 直切（fixedDualState switch 路径）+ ProjectionProvider "mirror-mode" 开关（duo_dual/mirror pref，当前 0）。
+- **装机状态**：home 已切回 DuoHomeActivity；mirror pref=0；会话 running primary=内屏 state 5；内屏 DuoHome 截图验证恢复（revert_inner.png）。
+- **本轮学到的结论**：① display 0=主屏、面板常亮（state hold 双屏不断电成立），但**换主屏=系统层窗口栈迁移，composer 会硬清一帧，应用侧遮罩无法覆盖**——任何依赖 5↔6 翻转的方案都有此天花板；② 镜像 VD（无 OWN_CONTENT_ONLY）通道可用且能 1:1 裁剪采样（buffer 尺寸必须与 VD 严格一致否则 DisplayManager letterbox 叠加）；③ 内屏 pane 物理方向：turn 变换补偿面板挂载旋转，折叠构建=物理上半=用户 hinge 右。（"一直镜像原生屏"：主屏原生直通+副屏实时镜像 display 0+触摸回注，三项截图实证；见"纯镜像架构"节）+ 原生面板接管实验（NativeShade，已被镜像方案取代）+ 双屏翻页卡顿三连修（另一会话）；DuoHome 全链停用保留；全部改动未提交 git
+
+## 纯镜像架构（2026-09-20 凌晨，本地未提交）
+
+- **用户拍板的方向**：项目初衷是开合不黑屏而非做桌面。架构=常驻 hold 双屏状态 + 副屏永远实时镜像 display 0 + 触摸回注；原生桌面/下拉/手势/多任务全部白送，DuoHome/GestureNav/HomeControlPanel/recents 管理全部不再需要。无状态翻转→无 rebind→开合不黑 by construction。
+- **实现**：① helper 新 AIDL `createMirrorContent`（FixedDualContentHost.createMirror：createVirtualDisplay 无 OWN_CONTENT_ONLY=镜像 display 0，PUBLIC+TRUSTED 反射，120Hz，无 IME/无 SECONDARY_HOME）；② `FixedDualContentHost.touch/key` 放开 displayId==0 注入（key 对 0 直注 BACK/HOME，不走 launchHome）；③ `FixedDualOutput` 加 `mirror` 构造参数：VD 走 createMirrorContent，deliver() 里 inverse 旋转后加 srcW/srcH（display 0 尺寸）缩放矩阵再 `dualTouch(0,…)`，绕过 shadeBand/feedback；④ `FixedDualSession` mirrorMode（duo_dual/mirror pref，provider 方法 **mirror-mode** arg 0/1 切换）：maintain() 不再要求 home role，prepare() 只给**非 primary** 面板建输出（主屏=原生本体），contentReady/状态行按单输出；**镜像输出永不挂帘幕**（frame 的 block 对 mirror=false——一直亮是目的）。
+- **验证（折叠态，state 6 封面=display 0）**：封面直通 MIUI 原生桌面（mirror_cover.png）✓；内屏（折叠隐藏面）实时镜像出 display 0 完整画面（mirror_inner2.png，帘幕修复前黑屏——旧 policy 折叠时 curtain 非可见面板）✓；内屏镜像面板注入下拉→封面 display 0 原生通知面板打开（touch_cover.png，回注链路全通）✓。
+- **装机状态**：home 已切 `com.miui.home/com.miui.home.launcher.Launcher`（cmd package set-home-activity）；mirror-mode=1 在跑；session 折叠态启动→state 6（封面 primary，内屏镜像）。
+- **右侧半区锚定（02:4x 轮）**：用户反馈"展开时镜像居中"——根因是镜像 VD 全屏（2364x1672 横），DisplayManager 把封面竖屏内容等比缩放居中留双边。修复：FixedDualOutput 镜像模式引入 paneW/paneH=右半（width/2×height），窗口(root+forwarder)宽度 paneW+Gravity.RIGHT、texture 同尺寸右贴、**镜像模式跳过 turn 旋转变换**（VD 按 pane 自身取向创建）、VD/GPU/surface 全按 pane 尺寸、deliver() 触摸映射 pane→display 0。折叠态截图验证：镜像完整贴右半、左半黑（right_half1.png）；右半区注入下拉→display 0 原生通知面板开（right_half_touch.png）✓。
+- **待办/注意**：① **展开后需 re-toggle mirror-mode 让会话以横屏几何重建**（pane 尺寸取自会话启动时姿态；折叠态启动的会话展开后窗口几何是旧帧）——根治需 display rotation listener 动态重排（resize VD+dualSurface 重绑+gpu 重建）；② 目标形态是 state 5（内屏 primary）+封面镜像——需**展开态启动会话**（helper fixedDualState 只能 hold 当前 primary 不能翻转）；展开后 re-toggle mirror-mode 或重启会话即可；③ 用户真机开合体验（黑屏/亮度/延迟）待验；④ 镜像 VD 分辨率=pane 尺寸，开合旋转/纵横比映射未验；⑤ NativeShade/自制面板代码闲置保留；⑥ 三键导航在原生侧正常显示（镜像里同步可见）。① 目标形态是 state 5（内屏 primary）+封面镜像——需**展开态启动会话**（helper fixedDualState 只能 hold 当前 primary 不能翻转）；展开后 re-toggle mirror-mode 或重启会话即可；② 用户真机开合体验（黑屏/亮度/延迟）待验；③ 镜像 VD 分辨率=面板尺寸，DisplayManager 缩放 display 0 内容，横竖切换（开合）时的旋转/纵横比映射未验；④ NativeShade/自制面板代码闲置保留；⑤ 三键导航在原生侧正常显示（镜像里同步可见）。
+
+## 原生面板接管实验（2026-09-20 凌晨，本地未提交）
+
+- **关键发现**：封面物理屏就是 display 0（折叠态 primary），原生桌面/SystemUI 一直在我们覆盖窗后面——**不需要镜像**，撤出即可见、可触。
+- **机制**（新类 `NativeShade`）：`ProjectionService.updateShadeBar` 里 HomeControlPanel 三行接线已注释改走 NativeShade；触发后 ① `removeShadeBarAt(0)` 撤 display 0 的 Duo home bar（`NativeShade.blocking()==id` 防重挂）；② `FixedDualOutput.setNativeShade(true)`：forwarder 加 FLAG_NOT_TOUCHABLE+INVISIBLE、texture INVISIBLE（**绝不能 GONE/移除**——SurfaceTexture 销毁会 fail 整个会话，onSurfaceTextureDestroyed 已加 nativeShade 守卫）；③ 经 helper `svc("input swipe …")` 注入下拉（**a11y dispatchGesture 实测唤不醒 HyperOS 面板，shell input 可以**，HomeMigrator 先例）；④ watch 每 350ms 扫 getWindows()：display 0 有大 systemui 窗口（≥35% 屏高）= 面板在；连续 3 次消失且重注入一次仍失败才恢复；45s 超时/灭屏/锁屏兜底恢复。
+- **恢复**：`setNativeShade(false)` 反向还原 + `refreshShadeBars()` 重挂 bar。真机闭环：触发→原生面板开→BACK 关→"restore: shade dismissed"→桌面完整回归（out/cc-compare/native*.png）。
+- **三键导航栏修复（同轮）**：撤出期间经 helper `settings put global policy_control immersive.navigation=*` 只隐藏导航栏（原生桌面全高、与我们桌面布局一致，HyperOS 尊重该 policy，final_launcher.png 验证 4×5 格+dock 满高无三键）；restore/sessionEnded 时 `settings delete global policy_control` 清理（FixedDualSession.close 兜底调用）。watch 增加 `latched` 标志：面板成功打开过一次后消失=真关闭，立即恢复不再重注入（修复重注入与快速关闭打架的循环）。
+- **待办**：注入 x=86% 开的是通知侧而非控制侧（手工 swipe x=81% 开的是控制中心），左右判定待调；真手指体验未测；state 6（封面非 primary）路径未验证；HomeControlPanel 类与 OPEN_SHADE 调试广播仍闲置保留。
+
+## 双屏翻页卡顿根因与修复（2026-09-20 凌晨，本地未提交）
+
+- **用户症状**：双屏同开下桌面翻页滑动只有 50~70fps（对照：原生桌面同场景 110+）；用户对自适应无意见，只要滑动流畅。
+- **根因（实锤）**：不是面板上限、不是虚拟屏 60Hz 帽——虚拟屏产帧实测可达 ~110fps；是**输出呈现与 120Hz vsync 错拍**：FixedDualGpu 4ms 自由轮询连续 swap，抖动 cadence 让 HyperOS 自适应在拖拽期间**追频抖动**（实测外屏 60↔72↔90↔120 乱跳，内屏 lead-follow 跟随）。MIUI 刷新率悬浮窗=面板档位=用户看到的 50~70。
+- **修复（已装机 20260919b，验证过）**：`FixedDualGpu.draw()` 呈现节流 `now-lastPresentMs>=8` 才 draw+swap。验收：拖拽起手 ~1s 面板 60→120，**全程稳 120**（7 连采样无跳变），结束回落 60（自适应正常）。
+- **失败方案（已回退勿重试）**：`postOnAnimation` vsync 节拍 + 输出窗口 8ms 保活 invalidate 环 → 三条全屏 GPU 管线互相挤兑，**翻页产帧崩到 12fps**（20260919a 即测即回退）。教训：输出窗口每次 invalidate=一次全屏 RT 合成，×2 屏 ×120Hz 不可承受；worker 自由轮询是吞吐基线。
+- **刷新率钳制在 lhasa HyperOS 全部无效（实证）**：`min_refresh_rate`（SettingsObserver 不读）、`global user_preferred_refresh_rate`（无效）、`set-user-preferred-display-mode`（**存得上但面板 userPreferredModeId 恒 -1**，存 120 或 120.00001 都不解析成模式；挂 pin 状态下空闲照样双屏同掉 60）。`applyPrimaryRate` 是安慰剂，且 guard 会被实验遗留 pin 卡住（d0/d1 已手动清回 null）。窗口 `preferredRefreshRate`+`setFrameRate(120,ALWAYS)` 单独压不住追频，但配合呈现节流行为正确。
+- **测量方法论**：adb `input swipe` 注入 ~30 事件/s，远程测产帧被输入限死（只能验面板档位/管线健康，**120Hz 手指路径只能用户实测**）；`renderFrameRate` 采样看档位；逻辑屏绑定会 swap（当前 d0=外屏 d1=内屏）；`input -d 1 swipe` 本机抛异常（无法远程驱动内屏）；装包期间 MIUI `killDueToPackageUpdate` 每 ~60s 杀进程重启（装后连串会话重建先查这个）。
+- 改动：FixedDualGpu.java（呈现节流）、FixedDualOutput.java（仅标记日志）。三件套过（marker="paced free-run build 20260919b"）。
+
+## 手指路径三连修（2026-09-20 凌晨第二班，build 20260920c，待用户手指实测）
+
+- **用户手指实测打脸 b 版**："还是不到60，内屏比刚刚还卡"——面板档位修复≠体感修复，真瓶颈在手指路径；adb 注入 ~30 事件/s 测不出 120Hz 触摸下的表现（已确认是测量盲区）。
+- **gfxinfo 实锤主线程窒息**：弹层动画（纯 Choreographer 驱动）中位帧时 **53ms≈19fps**（GPU 仅 11ms）——全进程单主线程（两块虚拟屏桌面 Activity+输出窗口+a11y 服务+触摸转发共享）被三处税拖死。
+- **三处修复（c 版）**：① `ProjectionService.update` 会话 active 时 tick 40ms→≥500ms（原来稳态下仍以 25次/s 在主线程跑 isRoleHeld/isInteractive 同步 binder）；② `FixedDualContentHost.inject` 模式 0(WAIT_FOR_RESULT)→2(ASYNC)——原来每个转发触摸阻塞到目标窗口处理完，手指 120Hz 串行等待直接压垮投递率（**UserService version 33→34 必须 bump，宿主代码才会替换**）；③ `DuoHomeActivity.onCreate` 窗口 `preferredRefreshRate=120`（虚拟屏桌面窗口此前从未投票，Choreographer 疑似跑 60）。
+- **验收（gfxinfo 同一动画）**：40 帧/中位 53ms/卡顿 27.5% → **194 帧/中位 12ms/卡顿 7.2%**——动画产帧打满 ~120fps。手指路径（ASYNC 投递率+120 投票）只能用户实测。
+- 注意：adb 拖拽测面板档位仍受"翻页位置在边缘/弹层未关"混淆（边界橡皮筋无内容→面板 60 是正常自适应，不是回退）。
+
+## 触摸投递三连修 d/e（2026-09-20 凌晨第三班，build 20260920e 已装机）
+
+- **手指实测数据（c 版，采样 fpswatch.log）**：手指拖拽期间面板全程稳 120 ✓，但 cover 虚拟屏产帧仅 42~101/s（均值 ~70）——瓶颈=触摸投递率：每事件"共享 worker 排队（被 40ms dualContact 同步往返挤占）+ 同步 binder 往返"，串行 ~10-15ms/事件。
+- **d 版（已回退其缺陷）**：`IHelperHost.dualTouch` 改 **oneway** + `MobileHelper` 触摸专用 `touchWorker` 线程。数据：产帧均值 ~70→~100/s、settle 冲 195/s。**缺陷：oneway 让宿主 binder 线程池并发处理，事件偶发乱序注入→拖拽位置后跳，手感反而差**（用户实测打回）。
+- **e 版（现行）**：保留 oneway+专线，`FixedDualContentHost.touch()` 加 `synchronized` 恢复宿主侧严格顺序（UserService version 35 强制宿主重载）。**待设备冷却后用户手指复测**。
+- **热限流发现（用户判断）**：连续数小时测试后机身过热，MIUI 锁帧——e 版手感差可能主要是热而不是代码；显示侧 `thermalRefreshRateThrottling={}` 为空但 MIUI 自有热策略不走此表，**复测前先冷却**。
+- 装机运维：d 版装后进程僵死（系统有 a11y 绑定但不拉起，am start 报 top-most 假象）→ **`am force-stop` + 无障碍双开关重绑**即恢复（进程 17719 会话 199/200）。00:18 又见一次已知重装启动竞态 NPE（ConfigurationController，自愈）。
+
+## GPU 直通复活（2026-09-20，build 20260920f 已装机，远程验证全过）
+
+- **用户拍板"做成跟原生一样"后启用**：第三十三轮禁用的 direct 旁路按其记录的前提修活——`FixedDualGpu` 构造加 `BooleanSupplier directAllowed`，`FixedDualOutput` 传 `()->contentId>=0`；64 帧恒等 → goDirect 门控放行（swap 同步返回即已重定向，leaveDirect 带重试回退）。
+- **直通=原生管线形状**：虚拟屏直接画进输出 TextureView（SF 合成虚拟屏 → GL 取帧 → shader 拷贝 → swap 四跳全免），折叠效果出现时 50ms 轮询发现 tilt/crop≠0 → leaveDirect 回 shader。
+- **远程验证**：双渲染器 `direct presented=` 生效、无黑屏（外屏 mean=143.8/stddev=56.8 真实内容）、swipe 期间 **278 帧 @中位 5ms @0% jank**（shader 模式最好 194@12ms）、面板起手即 120 全程稳。
+- **待用户手指实测**：①翻页跟手度 vs 原生；②**折叠/展开过渡**（leaveDirect 首次实战，若黑屏检查 swap 回退与 EGL 重挂重试）；③锁屏往返。
+- 若直通后仍差最后一点：下一步候选 TextureView→SurfaceView（SF 直合成零拷贝，虚拟屏 buffer 直接上屏，需 hidden setBufferTransform 做旋转）。
+
+## 翻页动画三件套（2026-09-20，build 20260920g 已装机，远程验证过待手指实测）
+
+- **用户指出布局缺陷**：dock 是 body 最右的兄弟列，pager 的进出边界=dock 左缘而非屏幕边缘；图标"在 dock 左侧一点点出现"。**修复（全出血 pager）**：body 外包 `bodyFrame`（FrameLayout）——pager 负边距抵消 root 水平 padding（insets listener 动态设置，clip 链 root/bodyFrame/body/panel 全 clipChildren=false），dock 用 `FrameLayout.LayoutParams(RIGHT)` 悬浮于 bodyFrame 上层，body 内留同宽 spacer 保持加权网格宽度不变；每页 `frame.setPadding(pageInsetLeft,0,pageInsetRight,0)`（左=屏幕左 padding，右=右 padding+68+dock 边距）让落位图标避让 dock。**效果：页面从物理屏幕边缘进出、从 dock 玻璃栏下方穿过、静止落位与旧版逐像素一致**（截图验证：4 列网格位置不变、dock 贴右缘、无遮挡；88dp 让位与 dock 占位精确吻合）。
+- **P0 物理落位（HomePager 重写）**：`PhysicsScroller` 替代五次缓出魔改——UP 时 VelocityTracker 取松手速度，startScroll 按摩擦模型闭式解（指数衰减插值 x(t)=D(1-e^-st)/(1-e^-s)，牛顿解 s 使初速=松手速度，dur=1.1·1000·D/v0 夹 [180,460]ms；K<1 或速度反向退化为 150-260ms 短补间）。**消除松手瞬间"急停一拍"的速度不连续**。
+- **P1 壁纸视差**：onPageScrolled → `WallpaperManager.setWallpaperOffsets`（每帧 binder，try/catch 包裹；MIUI 原生默认壁纸随翻页漂移）。`setPageMargin(12dp→0)`（页间隙会让图标离边缘偏移）+ `setPageCount` 供视差归一。
+- **远程验证**：中段跟手（mid-swipe 像素差 143.7）、页提交（diff 17.0）、第 0 页右滑正确弹回、无崩溃；**教训：`input swipe` 起点 x>926 会打在 dock 占位条上（spacer 不可见但吃触摸）——远程测试滑动起点选网格中央**。
+- **待用户手指实测**：跟手度/松手连续感/壁纸漂移/图标从边缘进出+穿 dock。P2 视觉风格（层叠景深/视差平移/纯平移）等用户摸完基础版再选。
+
+## 残影修复 + 视差平移（2026-09-20，build 20260920h 已装机，远程验证过）
+
+- **用户实测发现静止残影**：g 版全屏截图实锤——dock 玻璃栏中下段透出邻页图标半透明残影。**几何根因双重**：① ViewPager 自己不裁 children（靠祖先裁剪），祖先链 clipChildren 全关后邻页越界绘制；② **负边距只能平移不能加宽**（LinearLayout 按父宽测 MATCH_PARENT 子级）——pager 实际只到屏幕右缘内 66px，邻页恰好从这 66px 伸进 dock 区。
+- **修复**：pager 包进 `home-bleed` FrameLayout——负边距+**显式宽度=宿主宽+左右 padding**（OnLayoutChangeListener 基于宿主宽计算，防自引用膨胀），bleed 层自带裁剪（clipChildren=true 默认）：翻页时页面照常从物理边缘进出/穿 dock，静止时一切越界绘制裁在屏幕边缘。截图验证：dock 内只剩自己的图标、右缘窄条干净、网格与 dock 之间空白工整。
+- **视差平移（用户选的 P2）**：`setPageTransformer`——进入页 translationX=-0.15·position·width（跟手慢 15% 的克制层次），position=0 归零保证静止态逐像素对齐。中段/提交截图验证翻页正常（diff 20.3/14.7），无崩溃。
+- 装机运维：h 版装后 helper 重连卡 idle 两次 → **`am start DesktopActivity` 踢活**（老手法，有效）。
+- **边缘对齐终修（用户三纠：图标离屏幕边缘一点点就被切断）**：h/i 版公式只对窄屏成立——宽屏（内屏）bleed 左边距漏算组件面板占位（诊断日志实锤 absPanel=1020、want=1410≠2364，页面在 41% 屏宽处被切；外屏日志正常但用户肉眼仍见 33px 缺口，归因组件面板同源）。**k 版：bleed 改窗口绝对定位**——宽度=rootWidth、左边距=-absPanel（OnLayoutChangeListener 沿父链累计 panel 绝对左偏移，无自引用反馈），`pageInsetLeft=absPanel` 同步重锚（窄屏 33/宽屏 1020），静止网格两种布局都回原位。日志实证：外屏 bleed=[0,1168]、内屏 [0,2364]。**教训：嵌套加权布局里的全出血子视图，定位必须按窗口坐标算，不能只抵消单层 padding；负边距不会加宽 MATCH_PARENT 子视图。**
+- **用户再纠偏：网格离 dock 太远**——h 版 bleed 宽度只算了 host+左右 padding，漏了 dock 占位 209px，页内容区比原 workspace 窄、整体左移。**i 版一行修复**：`want=host+bleedLeft+pageInsetRight`（pageInsetRight 已含 sideRight+dockFootprint）→ bleed=[0,1168] 全屏、页内容=[33,926] 恰好落回原 workspace 矩形。截图实测：网格右缘 77% 屏宽 ↔ dock 左缘 79%，间隙 23px 紧邻如初；无残影；翻页正常（mid diff 15.7，视差使中段差值变小属预期）。
+
+
+
+
+- 下一步：①用户手指实测（悬浮窗应显 ~120 不跳）；②若面板稳 120 仍有顿挫→查虚拟屏 Choreographer/触摸转发同步 binder 延迟（dualTouch 改 oneway+时间戳修正另开一轮）。
+
+## 边缘淡入淡出（2026-09-20，build 20260920m 已装机）
+
+- **k 版窗口锚定被用户打回回滚（l 版恢复 i 版公式）**——内屏 bleed 左边距漏算组件面板占位的问题仍在，用户改选**视觉方案**：不再修裁剪几何，翻页边缘加淡入淡出消解硬切线。
+- **实现（HomePager transformer 一处）**：保留 15% 视差位移，alpha=|position|≤0.6 ? 1 : (1-|position|)/0.4——行程最后 40% 线性淡出/淡入，到屏幕边缘透明度归零，图标不再出现硬切；position=0 时 alpha=1 静止态逐像素不变。
+- 远程验证：中段截图确认旧页渐隐/新页渐显/无硬切线。参数（0.6 起淡点、0.4 淡出带）可按用户手感再调。
+- 遗留：内屏（wide）bleed 裁剪线在组件面板右缘（未修几何，被淡出掩盖）；若日后要真边缘对齐，参考 k 版思路但需修正页面内容锚定（pageInsetLeft 应=absPanel 而非叠加 sideLeft——k 版错误点已定位未验证）。
+
+## 磨砂边缘带尝试（2026-09-20，build n→o 已回退）
+
+- 用户要求"左右边框模糊虚化、不要硬边裁切"→ 实现 n 版：bleed 内加左右 44dp 磨砂带（HyperOS setBackgroundBlur 20dp + 0x8C121B1F 渐变填充，翻页期间 alpha 0→1，静止隐藏；HomePager 加 scrollActive 回调驱动）。
+- **用户实测"太难看了，不要这个模糊了，回退"** → o 版完整回退（带、字段、回调全删），恢复 m 版状态（纯 alpha 边缘淡入淡出 + 15% 视差）。**教训：系统模糊条叠在壁纸上观感脏，此路不通；边缘柔化只保留透明度渐隐方案。**
+
+## iOS 节奏调校（2026-09-20，build 20260920p 已装机）
+
+- **用户反馈"现在是线性平移吗？感觉很拖沓，查苹果的动画速度"**——确认：慢速松手路径确实是线性补间（拖沓根源）。苹果翻页实况（HIG+逆向共识）：iOS7 起为**临界阻尼弹簧**（damping=1 无回弹）+ 继承松手速度，慢速松手走 ease-in-out，整页 ~250-300ms，从不线性。
+- **调整**：① Friction 无速度分支线性→smoothstep（t²(3-2t) 平滑 ease-in-out），时长 180-280ms 按距离；② 快速松手系数 1.1→0.9、上限 460→380ms（更干脆）；③ 视差 15%→10%；④ 边缘淡出带 40%→28% 行程（起淡点 0.6→0.72）。磨砂带已按用户要求回退（n→o）。
+- 会话恢复运维照旧（force-stop+双开关+DesktopActivity 踢活）。
+
+## 控制中心 HyperOS 化（2026-09-19 深夜）
+
+- **目标**：按用户提供的 HyperOS 控制中心截图重做 `HomeControlPanel` 控制页；通知页/PaneHost 手势/玻璃背景全保留，外层静态 API（open/beginDrag/dragOn/releaseOn/closeIfOpen/bottomCovered）未动。
+- **布局**（density 2.75，内容列=右对齐 36%/64% 权重）：①两连 pill 卡 58dp——Wi-Fi 卡（开=白底蓝图标墨字"已连接"，关=磨砂）+蜂窝卡（常蓝底白字，标题取 TelephonyManager.getNetworkOperatorName，副标题已开启/已关闭，点击均走 svcToggle）；②媒体行 148dp——媒体卡(1.9f 权重,cast 角标+"暂无播放"+prev/play/next 按键经 AudioManager.dispatchMediaKeyEvent) + 亮度竖滑条(白填充橙日) + 音量竖滑条(蓝填充白喇叭)；③3×4 圆形开关网格：蓝牙/自动亮度/手电筒/静音/飞行模式/方向锁定/扫一扫/深色模式/勿扰模式/省电模式/投屏/小米互传。
+- **Tile 模型**：`Tile{label,glyph,accent,solid,BooleanSupplier active,Runnable action}` 替代逐个字段；涂色规则：开=白底 accent 图标，开且 solid=彩底白图标（省电绿/互传粉常亮），关=0x33787880 磨砂白图标。新增功能：自动亮度(SCREEN_BRIGHTNESS_MODE)、静音(setRingerMode)、方向锁定(ACCELEROMETER_ROTATION 取反)、省电(svc settings put global low_power)、扫一扫/小米互传(resolveActivity 探测包名，fallback toast)、投屏(ACTION_CAST_SETTINGS)。
+- **TileIcon** 新增 10 字形：CAST/SUN/SPEAKER/BELL(斜杠)/SCAN/BATTERY/TRANSFER/PREV/PLAY/NEXT；`VerticalSlider` 自绘（底部填充圆角卡+底缘 20dp 定色图标，竖向触摸取值，替代横向 PillSlider——已删除；PaneHost.overSlider 换引用）。
+- **两个布局坑**：①GridLayout 行 spec 带权重在 wrap 高度网格里把后两行折叠光（logcat "y3-y0<=0 inconsistent"），行 spec 必须不带权重、列才带；②内容总高 1712px 超屏 ~27px，三轮微调：媒体行 158→150→148、网格 topMargin 14→12→8、cell 76→73、底部手柄 40→32dp。
+- **装机**：设备旧包为异机 debug key（65a6a8b4…，本机 0a e7…不匹配）→ 卸载重装（用户拍板不备份数据）；adb 重授权：enabled_accessibility_services + accessibility_enabled=1 + enabled_notification_listeners 追加 DuoNotifications（settings put 一次成功，HyperOS 未拦截）；**Shizuku 授权因 uid 变化失效——下次应用请求时设备端会弹 Shizuku 授权框，需手点一次允许**，否则 svc 类开关走系统面板 fallback。手势验证用 `input -d 0 swipe 950 15 950 1100 300` 注入成功。
+- **遗留**：米家设备控制网格卡未做（无设备数据源）；媒体卡未接 MediaSession（拿不到当前播放态，仅转发 media key）；改动未提交 git。
 
 ## 固定双屏默认化 + 预览校验 + MiDuo 搬运（第二十三轮，2026-09-17 上午）
 

@@ -53,6 +53,10 @@ public class DuoHomeActivity extends Activity {
     private boolean editing,showWidgets,loaded,loading,reloadPending,wide;
     private LinearLayout root;
     private HomePager pager;
+    /** Horizontal insets each page applies so settled grids avoid the floating dock. */
+    private int pageInsetLeft,pageInsetRight;
+    /** Screen-side paddings the bleed frame must cancel to reach the physical edges. */
+    private int bleedLeft,bleedRight;
     private ScrollView widgetScroll;
     private int widgetScrollY;
     private TextView loadLabel;
@@ -130,6 +134,9 @@ public class DuoHomeActivity extends Activity {
         }});
         layout=store.read(); // Hosting startup removes IDs no longer allocated by the system.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER);
+        // The desktop's own windows never voted for a rate, so HyperOS kept the virtual
+        // displays' choreographer at 60 while the physical outputs asked for 120.
+        WindowManager.LayoutParams windowAttrs=getWindow().getAttributes();windowAttrs.preferredRefreshRate=120;getWindow().setAttributes(windowAttrs);
         getWindow().setStatusBarColor(Color.TRANSPARENT);getWindow().setNavigationBarColor(Color.TRANSPARENT);
         getWindow().setDecorFitsSystemWindows(false);
         getWindow().getDecorView(); // HyperOS does not create DecorView in getInsetsController().
@@ -284,8 +291,13 @@ public class DuoHomeActivity extends Activity {
         Rect bounds=getWindowManager().getCurrentWindowMetrics().getBounds();
         float density=getResources().getDisplayMetrics().density;
         wide=bounds.width()/density>=600;
+        // Pages bleed to the physical screen edge; settled grids keep the old inset so
+        // icons never rest under the floating dock.
+        pageInsetLeft=dp(wide?24:12);
+        pageInsetRight=pageInsetLeft+dp(68)+dp(wide?16:8);
         root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setTag("home-root");
         root.setBackgroundColor(Color.TRANSPARENT);
+        root.setClipChildren(false);
         FrameLayout content=new FrameLayout(this);
         content.addView(root,new FrameLayout.LayoutParams(-1,-1));
         if(editing)content.addView(removeOverlay());
@@ -295,7 +307,17 @@ public class DuoHomeActivity extends Activity {
             // Task displays run full height and the gesture gate owns the bottom strip on
             // every panel while the dual session runs; keep the desktop content above it.
             int band=FixedDualSession.active()?Math.round(FixedDualGestureFeedback.GESTURE_BAND_DP*density):0;
-            v.setPadding(bars.left+dp(wide?24:12),bars.top+dp(8),bars.right+dp(wide?24:12),bars.bottom+dp(12)+band);return insets;
+            int sideLeft=bars.left+dp(wide?24:12),sideRight=bars.right+dp(wide?24:12);
+            pageInsetLeft=sideLeft;
+            pageInsetRight=sideRight+dp(68)+dp(wide?16:8);
+            bleedLeft=sideLeft;bleedRight=sideRight;
+            v.setPadding(sideLeft,bars.top+dp(8),sideRight,bars.bottom+dp(12)+band);
+            if(pager!=null){
+                // The bleed frame's own width correction lives in its layout listener;
+                // here the pages re-apply the dock-free content rectangle.
+                for(int i=0;i<pager.getChildCount();i++)pager.getChildAt(i).setPadding(pageInsetLeft,0,pageInsetRight,0);
+            }
+            return insets;
         });
         LinearLayout header=row();header.setGravity(Gravity.CENTER_VERTICAL);
         header.setTag("home-header");
@@ -311,12 +333,23 @@ public class DuoHomeActivity extends Activity {
         // All three columns share one inset content rectangle. MATCH_PARENT plus top
         // margins could make weighted columns extend below the body's clipping edge.
         LinearLayout body=row();body.setTag("home-body");body.setBaselineAligned(false);body.setGravity(Gravity.TOP);
-        body.setPadding(0,dp(8),0,dp(8));root.addView(body,new LinearLayout.LayoutParams(-1,0,1));
+        body.setPadding(0,dp(8),0,dp(8));body.setClipChildren(false);
+        // The frame lets the dock float above the full-bleed pager: pages slide from the
+        // physical edges and pass underneath the dock rail instead of stopping at its side.
+        FrameLayout bodyFrame=new FrameLayout(this);bodyFrame.setTag("home-body-frame");bodyFrame.setClipChildren(false);
+        bodyFrame.addView(body,new FrameLayout.LayoutParams(-1,-1));
+        root.addView(bodyFrame,new LinearLayout.LayoutParams(-1,0,1));
         if(wide){View panel=widgetPanel();LinearLayout.LayoutParams wp=new LinearLayout.LayoutParams(0,-1,.95f);wp.setMargins(0,0,dp(18),0);body.addView(panel,wp);}
         View workspace=!wide&&showWidgets?widgetPanel():workspace();
+        if(workspace instanceof ViewGroup)((ViewGroup)workspace).setClipChildren(false);
         body.addView(workspace,new LinearLayout.LayoutParams(0,-1,1.1f));
-        LinearLayout.LayoutParams dockSize=new LinearLayout.LayoutParams(dp(68),-1);dockSize.setMargins(dp(wide?16:8),0,0,0);
-        body.addView(dockColumn(),dockSize);
+        // Invisible spacer with the dock's old footprint keeps the weighted grid width
+        // identical; the real dock overlays it from bodyFrame.
+        View dockSpacer=new View(this);
+        LinearLayout.LayoutParams spacerSize=new LinearLayout.LayoutParams(dp(68),-1);spacerSize.leftMargin=dp(wide?16:8);
+        body.addView(dockSpacer,spacerSize);
+        FrameLayout.LayoutParams dockSize=new FrameLayout.LayoutParams(dp(68),-1,Gravity.RIGHT|Gravity.TOP);
+        bodyFrame.addView(dockColumn(),dockSize);
         root.requestApplyInsets();
     }
     /** Drag-to-remove target shown while an edit-mode drag is in flight (MiDuo-style drop zone). */
@@ -360,7 +393,11 @@ public class DuoHomeActivity extends Activity {
         if(editing)panel.addView(title);
         HomePager pagesView=new HomePager(this);pager=pagesView;pagesView.setTag("home-pager");
         pagesView.setSaveFromParentEnabled(false);pagesView.setOffscreenPageLimit(1);
-        pagesView.setPageMargin(dp(12));
+        pagesView.setPageCount(layout.pages());
+        // Zero gap: with pages clipped at the screen edge, a page margin would hold the
+        // incoming icons off the edge by that gap.
+        pagesView.setPageMargin(0);
+        panel.setClipChildren(false);
         pagesView.setAdapter(new PagerAdapter(){
             @Override public int getCount(){return layout.pages();}
             @Override public boolean isViewFromObject(View view,Object item){return view==item;}
@@ -369,7 +406,31 @@ public class DuoHomeActivity extends Activity {
             }
             @Override public void destroyItem(ViewGroup container,int position,Object item){container.removeView((View)item);}
         });
-        pagesView.setCurrentItem(layout.page,false);panel.addView(pagesView,new LinearLayout.LayoutParams(-1,0,1));
+        pagesView.setCurrentItem(layout.page,false);
+        // ViewPager never clips its pages to its own bounds, so a screen-wide pager with
+        // clip-disabled ancestors shows the resting neighbour page bleeding under the
+        // dock. The bleed frame owns both the edge geometry and the clip: negative
+        // margins alone only shift (LinearLayout measures MATCH_PARENT as its own
+        // width), so its width is corrected explicitly to host + both side paddings —
+        // pages then render edge to edge mid-swipe and nothing survives past the
+        // screen once the swipe settles.
+        FrameLayout bleed=new FrameLayout(this);bleed.setTag("home-bleed");
+        bleed.addView(pagesView,new FrameLayout.LayoutParams(-1,-1));
+        bleed.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,orr,ob)->{
+            // Base the target on the host column: reading our own width here would grow
+            // by the side paddings on every correction pass. The frame must also cover
+            // the dock strip (pageInsetRight already carries sideRight + dock footprint)
+            // so pages clip at the physical edge and the page content rectangle lands
+            // exactly on the pre-bleed workspace column.
+            int host=((View)v.getParent()).getWidth();
+            if(host<=0)return;
+            LinearLayout.LayoutParams lp=(LinearLayout.LayoutParams)v.getLayoutParams();
+            int want=host+bleedLeft+pageInsetRight;
+            if(lp.width!=want||lp.leftMargin!=-bleedLeft||lp.rightMargin!=-bleedRight){
+                lp.width=want;lp.leftMargin=-bleedLeft;lp.rightMargin=-bleedRight;v.setLayoutParams(lp);
+            }
+        });
+        panel.addView(bleed,new LinearLayout.LayoutParams(-1,0,1));
         LinearLayout pages=row();pages.setGravity(Gravity.CENTER_VERTICAL);
         Button previous=button("‹",()->turn(-1));previous.setContentDescription("上一页");previous.setEnabled(layout.page>0);
         Button next=button("›",()->turn(1));next.setContentDescription("下一页");next.setEnabled(layout.page<layout.pages()-1);
@@ -396,6 +457,9 @@ public class DuoHomeActivity extends Activity {
     }
     private View appPage(int page){
         FrameLayout frame=new FrameLayout(this);
+        // Bleed geometry: the page view spans the screen, its content keeps the dock-free
+        // rectangle so resting icons sit exactly where they did before the overlay dock.
+        frame.setPadding(pageInsetLeft,0,pageInsetRight,0);
         FrameLayout scroll=new FrameLayout(this);scroll.setClipToPadding(false);frame.addView(scroll,new FrameLayout.LayoutParams(-1,-1));
         GridLayout grid=new GridLayout(this);grid.setTag("home-app-grid");int cols=HomeLayout.COLUMNS;
         grid.setColumnCount(cols);grid.setAlignmentMode(GridLayout.ALIGN_BOUNDS);scroll.addView(grid,new FrameLayout.LayoutParams(-1,-2));

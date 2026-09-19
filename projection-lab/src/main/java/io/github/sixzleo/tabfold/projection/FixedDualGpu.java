@@ -25,12 +25,14 @@ final class FixedDualGpu implements AutoCloseable {
     private final ProjectionEntrance entrance=new ProjectionEntrance();
     private long started;
     private final Surface output;
+    private final java.util.function.BooleanSupplier directAllowed;
     private final java.util.function.BiConsumer<Boolean,Surface> swap;
     private EGLConfig config;
     private boolean direct;
     private int identityFrames;
-    FixedDualGpu(Surface output,int width,int height,int contentHeight,boolean inner,java.util.function.Consumer<Surface> ready,java.util.function.Consumer<String> failed,java.util.function.BiConsumer<Boolean,Surface> swap){
-        this.width=width;this.height=height;this.contentHeight=contentHeight;this.inner=inner;this.failed=failed;this.output=output;this.swap=swap;thread.start();worker=new Handler(thread.getLooper());
+    private long lastPresentMs;
+    FixedDualGpu(Surface output,int width,int height,int contentHeight,boolean inner,java.util.function.BooleanSupplier directAllowed,java.util.function.Consumer<Surface> ready,java.util.function.Consumer<String> failed,java.util.function.BiConsumer<Boolean,Surface> swap){
+        this.width=width;this.height=height;this.contentHeight=contentHeight;this.inner=inner;this.failed=failed;this.output=output;this.directAllowed=directAllowed;this.swap=swap;thread.start();worker=new Handler(thread.getLooper());
         worker.post(()->{try{init(output);main.post(()->{if(!closed)ready.accept(input);});worker.post(draw);}catch(Exception e){error(e);}});
     }
     private void init(Surface output){
@@ -54,7 +56,7 @@ final class FixedDualGpu implements AutoCloseable {
         uniform("inner",inner?1:0);uniform("turn",0);uniform("screenDarkness",0);
         // The canvas keeps full panel height while the task buffer ends above the gesture strip;
         // the shader clamps sampling at that fraction and extends the bottom edge into the strip.
-        uniform("contentFraction",contentHeight>0&&contentHeight<height?(float)contentHeight/height:1f);
+        uniform("contentFraction",contentHeight>0&&contentHeight<height?(float)contentHeight/(float)height:1f);
         // While a fold effect animates, the band folds into the paper: no mirror, no dim.
         uniform("bandMix",1);
         // Desktop mode clears the gesture strip so the physical wallpaper shows through.
@@ -106,27 +108,37 @@ final class FixedDualGpu implements AutoCloseable {
                 boolean needsPyramid=opacity>=.001f&&tilt!=0f&&strength>0f;
                 if(needsPyramid&&pyramidDirty){pyramid.update(external,matrix,width,contentHeight,0);pyramidDirty=false;pyramidUpdates++;}
                 if(changed||!Float.isFinite(lastTilt)||Math.abs(tilt-lastTilt)>.002f||Math.abs(crop-lastCrop)>.00001f||opacity!=lastOpacity||strength!=lastStrength||bandClear!=lastBandClear||bandMix!=lastBandMix){
-                    pyramid.bind(program,width,height);
-                    GLES20.glActiveTexture(GLES20.GL_TEXTURE7);GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,external);
-                    GLES20.glUniform1i(GLES20.glGetUniformLocation(program,"nativeSource"),7);
-                    GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(program,"nativeTex"),1,false,matrix,0);
-                    uniform("tilt",(float)Math.toRadians(tilt));uniform("crop",crop);uniform("opacity",opacity);uniform("blurStrength",strength);
-                    uniform("bandClear",bandClear);lastBandClear=bandClear;
-                    uniform("bandMix",bandMix);lastBandMix=bandMix;
-                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4);
-                    if(!EGL14.eglSwapBuffers(display,window))throw new IllegalStateException("Present failed");
-                    presentedFrames++;
-                    lastTilt=tilt;lastCrop=crop;lastOpacity=opacity;lastStrength=strength;
+                    // Pace presents to at most ~120/s: back-to-back swaps inside one vsync
+                    // alias against the TextureView latch (one frame is dropped) and the
+                    // jitter makes HyperOS's adaptive policy hunt between 60/72/90 mid-swipe.
+                    boolean due=now-lastPresentMs>=8;
+                    if(due){
+                        pyramid.bind(program,width,height);
+                        GLES20.glActiveTexture(GLES20.GL_TEXTURE7);GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,external);
+                        GLES20.glUniform1i(GLES20.glGetUniformLocation(program,"nativeSource"),7);
+                        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(program,"nativeTex"),1,false,matrix,0);
+                        uniform("tilt",(float)Math.toRadians(tilt));uniform("crop",crop);uniform("opacity",opacity);uniform("blurStrength",strength);
+                        uniform("bandClear",bandClear);lastBandClear=bandClear;
+                        uniform("bandMix",bandMix);lastBandMix=bandMix;
+                        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4);
+                        if(!EGL14.eglSwapBuffers(display,window))throw new IllegalStateException("Present failed");
+                        presentedFrames++;lastPresentMs=now;
+                        lastTilt=tilt;lastCrop=crop;lastOpacity=opacity;lastStrength=strength;
+                    }
                 }
                 if(now-statsAt>=1000){statsAt=now;String stats="source="+sourceFrames+" pyramid="+pyramidUpdates+" presented="+presentedFrames+" tilt="+tilt+" needsBlur="+needsPyramid;if(inner)innerStats=stats;else coverStats=stats;}
             }
             // Steady identity means the shader is a plain copy; hand the TextureView straight
-            // to the virtual display until a fold effect develops again.
-            // Bypass disabled: it can fire before the virtual display exists (contentId=-1
-            // makes the surface swap a silent no-op) and steady folded state then stays black.
-            if(false&&tilt==0f&&crop==0f){if(++identityFrames>=64)goDirect();}
+            // to the virtual display until a fold effect develops again. The supplier gate
+            // keeps the swap from firing before the task display exists: dualSurface(-1,..)
+            // is a silent no-op and a folded-stable desktop would then stay black forever
+            // (2026-09-18 outage). The swap itself is synchronous, so once it returns the
+            // display is re-targeted; leaveDirect re-attaches EGL when a fold starts.
+            if(tilt==0f&&crop==0f){if(directAllowed.getAsBoolean()&&++identityFrames>=64)goDirect();}
             else identityFrames=0;
-            // Sample faster than the 8.3ms cadence of a 120Hz source, or adjacent frames merge.
+            // Free-run on the worker thread: touching the UI thread's choreographer from
+            // here floods main with traversals next to the desktop's own rendering and
+            // starves the whole pipeline (measured 12fps page swipes, 2026-09-19).
             worker.postDelayed(this,4);
         }catch(Exception e){error(e);}
     }};

@@ -28,12 +28,15 @@ import android.net.Uri;
 import android.os.BatteryManager;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.provider.Settings;
+import android.telephony.TelephonyManager;
 import android.text.TextUtils;
 import android.text.format.DateFormat;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -55,18 +58,23 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 /**
- * iOS-style shade in an accessibility overlay window. Notifications and control
- * are two real side-by-side pages inside a scrolled track, so pane swipes track
- * the finger 1:1 and settle in one continuous motion.
+ * HyperOS-style shade in an accessibility overlay window. The control page stacks
+ * connectivity pills, a media row with vertical sliders and a labelled toggle grid
+ * on a right-aligned column; notifications are the second real page inside the
+ * scrolled track, so pane swipes track the finger 1:1 and settle in one motion.
  */
 final class HomeControlPanel {
     // Glass materials: dock-tinted translucency with a bottom fade instead of a solid edge.
     private static final int TEXT=0xfff2f2f7, MUTED=0x99ebebf5, BLUE=0xff0a84ff;
     static final int PANEL_TINT=0xff121b1f, MODULE=0x42787880, CARD=0x463a3a44;
-    private static final int TORCH_ON=0xfff2f2f7, TORCH_GLYPH=0xff16161c, INDIGO=0xff5e5ce6;
+    private static final int INDIGO=0xff5e5ce6;
+    // HyperOS accent set for the control page.
+    private static final int HYPER_BLUE=0xff3478f6, ORANGE=0xffff9500, RED=0xfffa3b30,
+        GREEN=0xff34c759, PINK=0xffff5c8d, WHITE=0xffffffff, INK=0xff1c1c1e;
     private static final Typeface MEDIUM=Typeface.create("sans-serif-medium",Typeface.NORMAL);
 
     private static final Map<Integer,HomeControlPanel> currentByDisplay=new HashMap<>();
@@ -82,9 +90,13 @@ final class HomeControlPanel {
     private boolean control;
     private float fade; // 0 = notification page, 1 = control page
     private boolean animating;
-    private LinearLayout torchTile,rotateTile,dndTile,darkTile,wifiTile,btTile,dataTile,airTile;
+    private Tile[] tiles;
+    private LinearLayout[] tileBoxes;
+    private LinearLayout wifiCard,cellCard;
+    private TileIcon wifiGlyph,cellGlyph;
+    private TextView wifiTitle,wifiSub,cellTitle,cellSub;
+    private VerticalSlider brightnessSlider,volumeSlider;
     private boolean wifiOn,btOn,dataOn=true,airOn;
-    private PillSlider brightnessSlider,volumeSlider;
     private ScrollView notifList;
     private LinearLayout notifBox;
     private TextView notifHead,batteryLabel;
@@ -195,7 +207,7 @@ final class HomeControlPanel {
                 default:return true;
             }
         });
-        panel.addView(handle,new LinearLayout.LayoutParams(-1,dp(40)));
+        panel.addView(handle,new LinearLayout.LayoutParams(-1,dp(32)));
         root=new FrameLayout(wc);
         root.setOnClickListener(v->close());
         root.addView(scrim,new FrameLayout.LayoutParams(-1,-1));
@@ -358,22 +370,48 @@ final class HomeControlPanel {
     }
     private void buildControlPane(LinearLayout target){
         readConnectivityStates();
+        buildTiles();
         target.addView(compactHeader(),new LinearLayout.LayoutParams(-1,dp(42)));
-        target.addView(brightnessRow(),rowMargins(dp(52)));
-        target.addView(volumeRow(),rowMargins(dp(52)));
-        GridLayout grid=new GridLayout(service);grid.setColumnCount(4);
-        wifiTile=circle("Wi-Fi",TileIcon.WIFI);
-        btTile=circle("蓝牙",TileIcon.BLUETOOTH);
-        dataTile=circle("数据",TileIcon.CELL);
-        airTile=circle("飞行模式",TileIcon.AIRPLANE);
-        torchTile=circle("手电筒",TileIcon.TORCH);
-        rotateTile=circle("自动旋转",TileIcon.ROTATE);
-        dndTile=circle("勿扰",TileIcon.DND);
-        darkTile=circle("深色模式",TileIcon.DARK);
-        for(View tile:new View[]{wifiTile,btTile,dataTile,airTile,torchTile,rotateTile,dndTile,darkTile})
-            grid.addView(tile,circleSpec());
-        target.addView(grid,rowMargins(dp(168)));
+        LinearLayout column=new LinearLayout(service);column.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams cardsSize=new LinearLayout.LayoutParams(-1,dp(58));cardsSize.topMargin=dp(12);
+        column.addView(rightRow(cardsRow(),true),cardsSize);
+        LinearLayout.LayoutParams midSize=new LinearLayout.LayoutParams(-1,dp(148));midSize.topMargin=dp(12);
+        column.addView(rightRow(midRow(),true),midSize);
+        LinearLayout.LayoutParams gridSize=new LinearLayout.LayoutParams(-1,-2);gridSize.topMargin=dp(8);
+        column.addView(rightRow(toggleGrid(),false),gridSize);
+        target.addView(column,new LinearLayout.LayoutParams(-1,-2));
         paintTiles();
+    }
+    /** Right-aligned content column: dead glass on the left, cards on the right, like HyperOS. */
+    private LinearLayout rightRow(View content,boolean fillHeight){
+        LinearLayout row=new LinearLayout(service);row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(new View(service),new LinearLayout.LayoutParams(0,fillHeight?-1:-2,0.36f));
+        row.addView(content,new LinearLayout.LayoutParams(0,fillHeight?-1:-2,0.64f));
+        return row;
+    }
+    private void buildTiles(){
+        tiles=new Tile[]{
+            new Tile("蓝牙",TileIcon.BLUETOOTH,HYPER_BLUE,false,()->btOn,()->
+                svcToggle("svc bluetooth enable","svc bluetooth disable",btOn,()->btOn=!btOn,
+                    Settings.ACTION_BLUETOOTH_SETTINGS)),
+            new Tile("自动亮度",TileIcon.SUN,ORANGE,false,()->autoBright(),this::toggleAutoBright),
+            new Tile("手电筒",TileIcon.TORCH,INK,false,()->torchOn,this::toggleTorch),
+            new Tile("静音",TileIcon.BELL,RED,false,()->muted(),this::toggleMute),
+            new Tile("飞行模式",TileIcon.AIRPLANE,HYPER_BLUE,false,()->airOn,()->
+                svcToggle("cmd connectivity airplane-mode enable","cmd connectivity airplane-mode disable",airOn,()->{
+                    try{airOn=Settings.Global.getInt(service.getContentResolver(),Settings.Global.AIRPLANE_MODE_ON,0)==1;}
+                    catch(Exception ignored){airOn=!airOn;}
+                },Settings.ACTION_AIRPLANE_MODE_SETTINGS)),
+            new Tile("方向锁定",TileIcon.ROTATE,HYPER_BLUE,false,()->!rotateOn(),this::toggleRotate),
+            new Tile("扫一扫",TileIcon.SCAN,INK,false,()->false,this::launchScan),
+            new Tile("深色模式",TileIcon.DARK,HYPER_BLUE,false,()->darkMode(),this::toggleDark),
+            new Tile("勿扰模式",TileIcon.DND,INDIGO,false,()->dndOn(),this::toggleDnd),
+            new Tile("省电模式",TileIcon.BATTERY,GREEN,true,()->powerSave(),()->
+                svcToggle("settings put global low_power 1","settings put global low_power 0",powerSave(),()->{},
+                    Settings.ACTION_BATTERY_SAVER_SETTINGS)),
+            new Tile("投屏",TileIcon.CAST,HYPER_BLUE,false,()->false,()->start(new Intent(Settings.ACTION_CAST_SETTINGS))),
+            new Tile("小米互传",TileIcon.TRANSFER,PINK,true,()->true,this::launchMiShare),
+        };
     }
     private void buildNotifPane(LinearLayout target){
         // One compact top bar: small clock top-left, date beside it, clear-all right —
@@ -440,10 +478,6 @@ final class HomeControlPanel {
         paintBattery();
         return row;
     }
-    private LinearLayout.LayoutParams rowMargins(int height){
-        LinearLayout.LayoutParams size=new LinearLayout.LayoutParams(-1,height);
-        size.topMargin=dp(14);return size;
-    }
     private TextView pill(String label,View.OnClickListener action){
         TextView pill=pillText(label);pill.setOnClickListener(action);return pill;
     }
@@ -459,7 +493,121 @@ final class HomeControlPanel {
     }
     private void toast(String value){Toast.makeText(service,value,Toast.LENGTH_SHORT).show();}
 
-    // ---- tiles ----
+    // ---- connectivity cards + media + sliders ----
+    private View cardsRow(){
+        LinearLayout row=new LinearLayout(service);row.setOrientation(LinearLayout.HORIZONTAL);
+        wifiCard=new LinearLayout(service);wifiCard.setOrientation(LinearLayout.HORIZONTAL);
+        wifiCard.setGravity(Gravity.CENTER_VERTICAL);wifiCard.setPadding(dp(13),0,dp(8),0);
+        wifiGlyph=new TileIcon(service,TileIcon.WIFI);
+        wifiCard.addView(wifiGlyph,new LinearLayout.LayoutParams(dp(22),dp(22)));
+        LinearLayout wifiLabels=new LinearLayout(service);wifiLabels.setOrientation(LinearLayout.VERTICAL);
+        wifiLabels.setPadding(dp(9),0,0,0);
+        wifiTitle=HomeStyle.text(service,"Wi-Fi",13,TEXT);wifiTitle.setTypeface(MEDIUM);
+        wifiSub=HomeStyle.text(service,"",10,MUTED);
+        wifiLabels.addView(wifiTitle,new LinearLayout.LayoutParams(-2,-2));
+        wifiLabels.addView(wifiSub,new LinearLayout.LayoutParams(-2,-2));
+        wifiCard.addView(wifiLabels,new LinearLayout.LayoutParams(0,-2,1));
+        wifiCard.setClickable(true);
+        wifiCard.setOnClickListener(v->svcToggle("svc wifi enable","svc wifi disable",wifiOn,()->{
+            try{wifiOn=((android.net.wifi.WifiManager)service.getSystemService(Context.WIFI_SERVICE)).isWifiEnabled();}
+            catch(Exception ignored){wifiOn=!wifiOn;}
+        },Settings.Panel.ACTION_INTERNET_CONNECTIVITY));
+        LinearLayout.LayoutParams wifiSize=new LinearLayout.LayoutParams(0,-1,1f);wifiSize.rightMargin=dp(9);
+        row.addView(wifiCard,wifiSize);
+
+        cellCard=new LinearLayout(service);cellCard.setOrientation(LinearLayout.HORIZONTAL);
+        cellCard.setGravity(Gravity.CENTER_VERTICAL);cellCard.setPadding(dp(13),0,dp(8),0);
+        cellGlyph=new TileIcon(service,TileIcon.CELL);
+        cellCard.addView(cellGlyph,new LinearLayout.LayoutParams(dp(22),dp(22)));
+        LinearLayout cellLabels=new LinearLayout(service);cellLabels.setOrientation(LinearLayout.VERTICAL);
+        cellLabels.setPadding(dp(9),0,0,0);
+        cellTitle=HomeStyle.text(service,"",13,WHITE);cellTitle.setTypeface(MEDIUM);
+        cellSub=HomeStyle.text(service,"",10,0xb3ffffff);
+        cellLabels.addView(cellTitle,new LinearLayout.LayoutParams(-2,-2));
+        cellLabels.addView(cellSub,new LinearLayout.LayoutParams(-2,-2));
+        cellCard.addView(cellLabels,new LinearLayout.LayoutParams(0,-2,1));
+        cellCard.setClickable(true);
+        cellCard.setOnClickListener(v->svcToggle("svc data enable","svc data disable",dataOn,()->dataOn=!dataOn,
+            Settings.Panel.ACTION_INTERNET_CONNECTIVITY));
+        row.addView(cellCard,new LinearLayout.LayoutParams(0,-1,1f));
+        return row;
+    }
+    private View midRow(){
+        LinearLayout row=new LinearLayout(service);row.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout media=new LinearLayout(service);media.setOrientation(LinearLayout.VERTICAL);
+        media.setPadding(dp(12),dp(10),dp(12),dp(6));
+        media.setBackground(HomeStyle.surface(media,MODULE,28));
+        FrameLayout castRow=new FrameLayout(service);
+        TileIcon cast=new TileIcon(service,TileIcon.CAST);cast.setColor(0x99ebebf5);
+        castRow.addView(cast,new FrameLayout.LayoutParams(dp(16),dp(16),Gravity.END|Gravity.TOP));
+        media.addView(castRow,new LinearLayout.LayoutParams(-1,dp(18)));
+        media.addView(new View(service),new LinearLayout.LayoutParams(-1,0,1f));
+        TextView mediaLabel=HomeStyle.text(service,"暂无播放",12,MUTED);
+        mediaLabel.setGravity(Gravity.CENTER);
+        media.addView(mediaLabel,new LinearLayout.LayoutParams(-1,-2));
+        media.addView(new View(service),new LinearLayout.LayoutParams(-1,0,1f));
+        LinearLayout controls=new LinearLayout(service);controls.setGravity(Gravity.CENTER);
+        controls.addView(transport(TileIcon.PREV,dp(38),dp(17)));
+        LinearLayout.LayoutParams playGap=new LinearLayout.LayoutParams(dp(46),dp(46));playGap.leftMargin=dp(12);
+        controls.addView(transport(TileIcon.PLAY,dp(46),dp(22)),playGap);
+        LinearLayout.LayoutParams nextGap=new LinearLayout.LayoutParams(dp(38),dp(38));nextGap.leftMargin=dp(12);
+        controls.addView(transport(TileIcon.NEXT,dp(38),dp(17)),nextGap);
+        media.addView(controls,new LinearLayout.LayoutParams(-1,dp(46)));
+        row.addView(media,new LinearLayout.LayoutParams(0,-1,1.9f));
+
+        brightnessSlider=new VerticalSlider(service,0xf2ffffff,TileIcon.SUN,ORANGE);
+        boolean granted=Settings.System.canWrite(service);
+        int value;
+        try{value=Settings.System.getInt(service.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,120);}
+        catch(RuntimeException e){value=120;}
+        brightnessSlider.setValue(value/255f);
+        brightnessSlider.setEnabled(granted);
+        brightnessSlider.setChange(t->{
+            try{Settings.System.putInt(service.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,Math.max(2,Math.round(t*255f)));}
+            catch(RuntimeException ignored){}
+        });
+        if(!granted)brightnessSlider.setOnClickListener(v->openWriteSettings());
+        LinearLayout.LayoutParams brightSize=new LinearLayout.LayoutParams(0,-1,0.72f);brightSize.leftMargin=dp(10);
+        row.addView(brightnessSlider,brightSize);
+
+        volumeSlider=new VerticalSlider(service,HYPER_BLUE,TileIcon.SPEAKER,WHITE);
+        AudioManager audio=(AudioManager)service.getSystemService(Context.AUDIO_SERVICE);
+        int max=audio!=null?audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC):15;
+        int now=audio!=null?audio.getStreamVolume(AudioManager.STREAM_MUSIC):8;
+        volumeSlider.setValue(max>0?Math.min(1f,now/(float)max):0f);
+        volumeSlider.setChange(t->{
+            try{audio.setStreamVolume(AudioManager.STREAM_MUSIC,Math.round(t*max),0);}catch(RuntimeException ignored){}
+        });
+        LinearLayout.LayoutParams volumeSize=new LinearLayout.LayoutParams(0,-1,0.72f);volumeSize.leftMargin=dp(10);
+        row.addView(volumeSlider,volumeSize);
+        return row;
+    }
+    private View transport(int glyphType,int box,int glyph){
+        FrameLayout button=new FrameLayout(service);
+        TileIcon icon=new TileIcon(service,glyphType);icon.setColor(0xfff2f2f7);
+        button.addView(icon,new FrameLayout.LayoutParams(glyph,glyph,Gravity.CENTER));
+        button.setBackground(HomeStyle.ripple(button,box/2));
+        button.setOnClickListener(v->mediaKey(glyphType==TileIcon.PREV?KeyEvent.KEYCODE_MEDIA_PREVIOUS
+            :glyphType==TileIcon.NEXT?KeyEvent.KEYCODE_MEDIA_NEXT:KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE));
+        return button;
+    }
+    private void mediaKey(int code){
+        AudioManager audio=(AudioManager)service.getSystemService(Context.AUDIO_SERVICE);
+        if(audio==null)return;
+        audio.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN,code));
+        audio.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_UP,code));
+    }
+    private View toggleGrid(){
+        GridLayout grid=new GridLayout(service);grid.setColumnCount(4);
+        tileBoxes=new LinearLayout[tiles.length];
+        for(int i=0;i<tiles.length;i++){
+            final int index=i;
+            tileBoxes[i]=circle(tiles[i].label,tiles[i].glyph);
+            tileBoxes[i].setOnClickListener(v->tiles[index].action.run());
+            grid.addView(tileBoxes[i],circleSpec());
+        }
+        return grid;
+    }
     private LinearLayout circle(String label,int glyphType){
         LinearLayout box=new LinearLayout(service);box.setOrientation(LinearLayout.VERTICAL);
         box.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -471,13 +619,14 @@ final class HomeControlPanel {
         text.setGravity(Gravity.CENTER);text.setSingleLine(true);
         box.addView(text,new LinearLayout.LayoutParams(-2,dp(15)));
         box.setTag(new Object[]{circle,glyph,text});
-        box.setOnClickListener(v->onTile(label));
         return box;
     }
     private GridLayout.LayoutParams circleSpec(){
+        // Weighted columns share the row width; rows size themselves to the fixed cell
+        // height — a weighted row spec inside a wrap-height grid collapses every extra row.
         GridLayout.LayoutParams spec=new GridLayout.LayoutParams(
-            GridLayout.spec(GridLayout.UNDEFINED,1,1f),GridLayout.spec(GridLayout.UNDEFINED,1,1f));
-        spec.width=0;spec.height=dp(80);
+            GridLayout.spec(GridLayout.UNDEFINED),GridLayout.spec(GridLayout.UNDEFINED,1,1f));
+        spec.width=0;spec.height=dp(73);
         spec.setMargins(dp(3),dp(3),dp(3),dp(3));
         return spec;
     }
@@ -504,87 +653,123 @@ final class HomeControlPanel {
             paintTiles();
         });
     }
-    private void onTile(String label){
-        switch(label){
-            case "Wi-Fi":{
-                svcToggle("svc wifi enable","svc wifi disable",wifiOn,()->{
-                    try{wifiOn=((android.net.wifi.WifiManager)service.getSystemService(Context.WIFI_SERVICE)).isWifiEnabled();}
-                    catch(Exception ignored){wifiOn=!wifiOn;}
-                },Settings.Panel.ACTION_INTERNET_CONNECTIVITY);
-                return;
-            }
-            case "蓝牙":{
-                svcToggle("svc bluetooth enable","svc bluetooth disable",btOn,()->btOn=!btOn,
-                    Settings.ACTION_BLUETOOTH_SETTINGS);
-                return;
-            }
-            case "数据":{
-                svcToggle("svc data enable","svc data disable",dataOn,()->dataOn=!dataOn,
-                    Settings.Panel.ACTION_INTERNET_CONNECTIVITY);
-                return;
-            }
-            case "飞行模式":{
-                svcToggle("cmd connectivity airplane-mode enable","cmd connectivity airplane-mode disable",airOn,()->{
-                    try{airOn=Settings.Global.getInt(service.getContentResolver(),Settings.Global.AIRPLANE_MODE_ON,0)==1;}
-                    catch(Exception ignored){airOn=!airOn;}
-                },Settings.ACTION_AIRPLANE_MODE_SETTINGS);
-                return;
-            }
-            case "手电筒":{
-                if(torchId==null){toast("没有可用的闪光灯");return;}
-                try{torchManager.setTorchMode(torchId,!torchOn);}catch(CameraAccessException ignored){}
-                return;
-            }
-            case "自动旋转":{
-                if(!Settings.System.canWrite(service)){openWriteSettings();return;}
-                int current=Settings.System.getInt(service.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,0);
-                Settings.System.putInt(service.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,current==1?0:1);
-                paintTiles();return;
-            }
-            case "勿扰":{
-                NotificationManager notifications=(NotificationManager)service.getSystemService(Context.NOTIFICATION_SERVICE);
-                if(notifications==null)return;
-                if(!notifications.isNotificationPolicyAccessGranted()){
-                    start(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS));
-                    toast("请允许勿扰权限后返回");return;
-                }
-                boolean active=notifications.getCurrentInterruptionFilter()!=NotificationManager.INTERRUPTION_FILTER_ALL;
-                notifications.setInterruptionFilter(active?NotificationManager.INTERRUPTION_FILTER_ALL:NotificationManager.INTERRUPTION_FILTER_PRIORITY);
-                paintTiles();return;
-            }
-            case "深色模式":{
-                UiModeManager uiMode=(UiModeManager)service.getSystemService(Context.UI_MODE_SERVICE);
-                if(uiMode==null)return;
-                boolean dark=(service.getResources().getConfiguration().uiMode&android.content.res.Configuration.UI_MODE_NIGHT_MASK)
-                    ==android.content.res.Configuration.UI_MODE_NIGHT_YES;
-                uiMode.setNightMode(dark?UiModeManager.MODE_NIGHT_NO:UiModeManager.MODE_NIGHT_YES);
-                return;
-            }
+    private void start(Intent intent,String packageName){
+        PackageManager packages=service.getPackageManager();
+        Intent launch=new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setPackage(packageName);
+        if(packages.resolveActivity(launch,0)!=null)start(launch);
+        else toast("未找到"+packageName);
+    }
+    private void launchScan(){start(new Intent(),"com.xiaomi.scanner");}
+    private void launchMiShare(){
+        PackageManager packages=service.getPackageManager();
+        for(String pkg:new String[]{"com.xiaomi.mishare","com.xiaomi.mi_connect_service"}){
+            Intent launch=new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setPackage(pkg);
+            if(packages.resolveActivity(launch,0)!=null){start(launch);return;}
         }
+        toast("未找到小米互传");
+    }
+
+    // ---- toggle states & actions ----
+    private boolean autoBright(){
+        return Settings.System.getInt(service.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS_MODE,
+            Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)==Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC;
+    }
+    private boolean rotateOn(){
+        return Settings.System.getInt(service.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,0)==1;
+    }
+    private boolean darkMode(){
+        return (service.getResources().getConfiguration().uiMode&android.content.res.Configuration.UI_MODE_NIGHT_MASK)
+            ==android.content.res.Configuration.UI_MODE_NIGHT_YES;
+    }
+    private boolean dndOn(){
+        NotificationManager notifications=(NotificationManager)service.getSystemService(Context.NOTIFICATION_SERVICE);
+        return notifications!=null&&notifications.getCurrentInterruptionFilter()!=NotificationManager.INTERRUPTION_FILTER_ALL;
+    }
+    private boolean muted(){
+        AudioManager audio=(AudioManager)service.getSystemService(Context.AUDIO_SERVICE);
+        return audio!=null&&audio.getRingerMode()!=AudioManager.RINGER_MODE_NORMAL;
+    }
+    private boolean powerSave(){
+        PowerManager power=(PowerManager)service.getSystemService(Context.POWER_SERVICE);
+        return power!=null&&power.isPowerSaveMode();
+    }
+    private void toggleTorch(){
+        if(torchId==null){toast("没有可用的闪光灯");return;}
+        try{torchManager.setTorchMode(torchId,!torchOn);}catch(CameraAccessException ignored){}
+    }
+    private void toggleAutoBright(){
+        if(!Settings.System.canWrite(service)){openWriteSettings();return;}
+        Settings.System.putInt(service.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS_MODE,
+            autoBright()?Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL:Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC);
+        paintTiles();
+    }
+    private void toggleMute(){
+        AudioManager audio=(AudioManager)service.getSystemService(Context.AUDIO_SERVICE);
+        if(audio==null)return;
+        audio.setRingerMode(muted()?AudioManager.RINGER_MODE_NORMAL:AudioManager.RINGER_MODE_SILENT);
+        paintTiles();
+    }
+    private void toggleRotate(){
+        if(!Settings.System.canWrite(service)){openWriteSettings();return;}
+        Settings.System.putInt(service.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,rotateOn()?0:1);
+        paintTiles();
+    }
+    private void toggleDark(){
+        UiModeManager uiMode=(UiModeManager)service.getSystemService(Context.UI_MODE_SERVICE);
+        if(uiMode==null)return;
+        uiMode.setNightMode(darkMode()?UiModeManager.MODE_NIGHT_NO:UiModeManager.MODE_NIGHT_YES);
+    }
+    private void toggleDnd(){
+        NotificationManager notifications=(NotificationManager)service.getSystemService(Context.NOTIFICATION_SERVICE);
+        if(notifications==null)return;
+        if(!notifications.isNotificationPolicyAccessGranted()){
+            start(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS));
+            toast("请允许勿扰权限后返回");return;
+        }
+        notifications.setInterruptionFilter(dndOn()?NotificationManager.INTERRUPTION_FILTER_ALL:NotificationManager.INTERRUPTION_FILTER_PRIORITY);
+        paintTiles();
     }
     private void paintTiles(){
-        if(wifiTile==null||torchTile==null)return;
-        boolean rotate=Settings.System.getInt(service.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,0)==1;
-        NotificationManager notifications=(NotificationManager)service.getSystemService(Context.NOTIFICATION_SERVICE);
-        boolean dnd=notifications!=null&&notifications.getCurrentInterruptionFilter()!=NotificationManager.INTERRUPTION_FILTER_ALL;
-        boolean dark=(service.getResources().getConfiguration().uiMode&android.content.res.Configuration.UI_MODE_NIGHT_MASK)
-            ==android.content.res.Configuration.UI_MODE_NIGHT_YES;
-        paintCircle(wifiTile,wifiOn,BLUE,0xffffffff);
-        paintCircle(btTile,btOn,BLUE,0xffffffff);
-        paintCircle(dataTile,dataOn,BLUE,0xffffffff);
-        paintCircle(airTile,airOn,BLUE,0xffffffff);
-        paintCircle(torchTile,torchOn,TORCH_ON,TORCH_GLYPH);
-        paintCircle(rotateTile,rotate,BLUE,0xffffffff);
-        paintCircle(dndTile,dnd,INDIGO,0xffffffff);
-        paintCircle(darkTile,dark,BLUE,0xffffffff);
+        if(tileBoxes==null)return;
+        for(int i=0;i<tiles.length;i++){
+            boolean on=tiles[i].active.getAsBoolean();
+            Object[] parts=(Object[])tileBoxes[i].getTag();
+            FrameLayout circle=(FrameLayout)parts[0];
+            TileIcon glyph=(TileIcon)parts[1];TextView label=(TextView)parts[2];
+            int bg,fg;
+            if(on&&tiles[i].solid){bg=tiles[i].accent;fg=WHITE;}
+            else if(on){bg=WHITE;fg=tiles[i].accent;}
+            else{bg=0x33787880;fg=0xfff2f2f7;}
+            glyph.setColor(fg);
+            label.setTextColor(on?WHITE:MUTED);
+            circle.setBackground(HomeStyle.surface(circle,bg,999));
+        }
+        paintCards();
     }
-    private void paintCircle(LinearLayout box,boolean active,int activeBg,int activeGlyph){
-        Object[] parts=(Object[])box.getTag();
-        FrameLayout circle=(FrameLayout)parts[0];
-        TileIcon glyph=(TileIcon)parts[1];TextView label=(TextView)parts[2];
-        glyph.setColor(active?activeGlyph:0xfff2f2f7);
-        label.setTextColor(active?0xffffffff:MUTED);
-        circle.setBackground(HomeStyle.surface(circle,active?activeBg:0x33787880,999));
+    private void paintCards(){
+        if(wifiCard==null)return;
+        if(wifiOn){
+            wifiCard.setBackground(HomeStyle.surface(wifiCard,0xf7ffffff,30));
+            wifiGlyph.setColor(HYPER_BLUE);
+            wifiTitle.setTextColor(INK);wifiSub.setTextColor(0x803c3c43);
+        }else{
+            wifiCard.setBackground(HomeStyle.surface(wifiCard,0x40787880,30));
+            wifiGlyph.setColor(0xfff2f2f7);
+            wifiTitle.setTextColor(TEXT);wifiSub.setTextColor(MUTED);
+        }
+        wifiSub.setText(wifiOn?"已连接":"已关闭");
+        cellCard.setBackground(HomeStyle.surface(cellCard,HYPER_BLUE,30));
+        cellGlyph.setColor(WHITE);
+        cellSub.setText(dataOn?"已开启":"已关闭");
+        cellTitle.setText(carrierName());
+    }
+    private String carrierName(){
+        try{
+            TelephonyManager telephony=(TelephonyManager)service.getSystemService(Context.TELEPHONY_SERVICE);
+            String name=telephony!=null?telephony.getNetworkOperatorName():null;
+            if(!TextUtils.isEmpty(name))return name;
+        }catch(RuntimeException ignored){}
+        return "移动数据";
     }
     private void paintBattery(){
         if(batteryLabel==null||batteryPercent<0)return;
@@ -599,36 +784,6 @@ final class HomeControlPanel {
     private void openWriteSettings(){
         start(new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS).setData(Uri.parse("package:"+service.getPackageName())));
         toast("请允许修改系统设置后返回");
-    }
-
-    // ---- sliders ----
-    private View brightnessRow(){
-        brightnessSlider=new PillSlider(service,true);
-        PillSlider slider=brightnessSlider;
-        boolean granted=Settings.System.canWrite(service);
-        int value;
-        try{value=Settings.System.getInt(service.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,120);}
-        catch(RuntimeException e){value=120;}
-        slider.setValue(value/255f);
-        slider.setEnabled(granted);
-        slider.setChange(t->{
-            try{Settings.System.putInt(service.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,Math.max(2,Math.round(t*255f)));}
-            catch(RuntimeException ignored){}
-        });
-        if(!granted)slider.setOnClickListener(v->openWriteSettings());
-        return slider;
-    }
-    private View volumeRow(){
-        AudioManager audio=(AudioManager)service.getSystemService(Context.AUDIO_SERVICE);
-        volumeSlider=new PillSlider(service,false);
-        PillSlider slider=volumeSlider;
-        int max=audio!=null?audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC):15;
-        int now=audio!=null?audio.getStreamVolume(AudioManager.STREAM_MUSIC):8;
-        slider.setValue(max>0?Math.min(1f,now/(float)max):0f);
-        slider.setChange(t->{
-            try{audio.setStreamVolume(AudioManager.STREAM_MUSIC,Math.round(t*max),0);}catch(RuntimeException ignored){}
-        });
-        return slider;
     }
 
     // ---- notifications ----
@@ -704,6 +859,16 @@ final class HomeControlPanel {
         return bitmap;
     }
     private int dp(float value){return Math.round(value*service.getResources().getDisplayMetrics().density);}
+
+    /** One labelled toggle: glyph, HyperOS accent, active-state probe and toggle action. */
+    private static final class Tile {
+        final String label;final int glyph,accent;final boolean solid;
+        final BooleanSupplier active;final Runnable action;
+        Tile(String label,int glyph,int accent,boolean solid,BooleanSupplier active,Runnable action){
+            this.label=label;this.glyph=glyph;this.accent=accent;this.solid=solid;
+            this.active=active;this.action=action;
+        }
+    }
 
     /**
      * Shade gesture host following the SystemUI recipe:
@@ -828,9 +993,9 @@ final class HomeControlPanel {
             if(raised>panel.getHeight()*0.06f||velY()<=-minFling)close();
             else panel.animate().translationY(0f).setDuration(200).start();
         }
-        /** Sliders own their horizontal drags; never steal gestures starting on them. */
+        /** Sliders own their drags; never steal gestures starting on them. */
         private boolean overSlider(MotionEvent event){
-            for(PillSlider slider:new PillSlider[]{brightnessSlider,volumeSlider})
+            for(VerticalSlider slider:new VerticalSlider[]{brightnessSlider,volumeSlider})
                 if(overView(event,slider))return true;
             return false;
         }
@@ -862,30 +1027,28 @@ final class HomeControlPanel {
         @Override public int getOpacity(){return PixelFormat.TRANSLUCENT;}
     }
 
-    /** Thick iOS-style pill slider: white fill with the glyph punched out (DST_OUT). */
-    private static final class PillSlider extends View {
-        private final boolean sun;
-        private final Paint fill=new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint cutFill=new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint cutStroke=new Paint(Paint.ANTI_ALIAS_FLAG);
+    /** HyperOS vertical slider card: bottom fill climbing the card, glyph pinned near the base. */
+    private final class VerticalSlider extends View {
+        private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint glyphFill=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint glyphStroke=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final int fillColor,glyphType,glyphColor;
         private float t;
         private Consumer<Float> change;
-        PillSlider(Context context,boolean sun){
-            super(context);this.sun=sun;
-            cutStroke.setStrokeWidth(1.8f);cutStroke.setStyle(Paint.Style.STROKE);
-            cutStroke.setStrokeCap(Paint.Cap.ROUND);
+        VerticalSlider(Context context,int fillColor,int glyphType,int glyphColor){
+            super(context);this.fillColor=fillColor;this.glyphType=glyphType;this.glyphColor=glyphColor;
+            glyphStroke.setStrokeWidth(1.7f);glyphStroke.setStyle(Paint.Style.STROKE);
+            glyphStroke.setStrokeCap(Paint.Cap.ROUND);glyphStroke.setStrokeJoin(Paint.Join.ROUND);
             setClickable(true);
         }
         void setValue(float value){t=Math.max(0f,Math.min(1f,value));invalidate();}
         void setChange(Consumer<Float> action){change=action;}
-        private int dp(float value){return Math.round(value*getResources().getDisplayMetrics().density);}
         @Override public boolean onTouchEvent(MotionEvent event){
             if(!isEnabled())return false;
             switch(event.getActionMasked()){
                 case MotionEvent.ACTION_DOWN:performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
                 case MotionEvent.ACTION_MOVE:{
-                    float start=dp(48),usable=getWidth()-start-dp(16);
-                    float value=Math.max(0f,Math.min(1f,(event.getX()-start)/usable));
+                    float value=Math.max(0f,Math.min(1f,(getHeight()-event.getY())/getHeight()));
                     if(value!=t){t=value;invalidate();if(change!=null)change.accept(t);}
                     return true;
                 }
@@ -893,50 +1056,43 @@ final class HomeControlPanel {
             }
         }
         @Override protected void onDraw(Canvas canvas){
-            float width=getWidth(),height=getHeight(),radius=height/2f;
-            fill.setColor(isEnabled()?0x2ef2f2f7:0x1af2f2f7);
-            canvas.drawRoundRect(0,0,width,height,radius,radius,fill);
-            float start=dp(48);
-            float end=start+t*(width-start-dp(16));
-            if(end>start){
-                int layer=canvas.saveLayer(0,0,width,height,null);
-                fill.setColor(0xe6f2f2f7);
-                canvas.drawRoundRect(0,0,end,height,radius,radius,fill);
-                cutFill.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.DST_OUT));
-                cutStroke.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.DST_OUT));
-                float scale=dp(20)/24f;
-                canvas.save();
-                canvas.translate(dp(14),(height-dp(20))/2f);
-                canvas.scale(scale,scale);
-                if(sun)drawSun(canvas);else drawSpeaker(canvas);
-                canvas.restore();
-                cutFill.setXfermode(null);cutStroke.setXfermode(null);
-                canvas.restoreToCount(layer);
+            float width=getWidth(),height=getHeight(),radius=width/2f;
+            paint.setColor(0x2ef2f2f7);
+            canvas.drawRoundRect(0,0,width,height,radius,radius,paint);
+            if(t>0.002f){
+                paint.setColor(fillColor);
+                canvas.drawRoundRect(0,height*(1f-t),width,height,radius,radius,paint);
             }
-        }
-        private void drawSun(Canvas canvas){
-            cutFill.setStyle(Paint.Style.FILL);
-            canvas.drawCircle(12,12,3.7f,cutFill);
-            for(int ray=0;ray<8;ray++){
-                double angle=Math.toRadians(ray*45);
-                canvas.drawLine(12+(float)Math.cos(angle)*5.6f,12+(float)Math.sin(angle)*5.6f,
-                    12+(float)Math.cos(angle)*8.1f,12+(float)Math.sin(angle)*8.1f,cutStroke);
+            float scale=dp(20)/24f;
+            canvas.save();
+            canvas.translate((width-dp(20))/2f,height-dp(36));
+            canvas.scale(scale,scale);
+            glyphFill.setColor(glyphColor);glyphStroke.setColor(glyphColor);
+            if(glyphType==TileIcon.SUN){
+                glyphFill.setStyle(Paint.Style.FILL);
+                canvas.drawCircle(12,12,3.7f,glyphFill);
+                for(int ray=0;ray<8;ray++){
+                    double angle=Math.toRadians(ray*45);
+                    canvas.drawLine(12+(float)Math.cos(angle)*5.6f,12+(float)Math.sin(angle)*5.6f,
+                        12+(float)Math.cos(angle)*8.1f,12+(float)Math.sin(angle)*8.1f,glyphStroke);
+                }
+            }else{
+                Path body=new Path();
+                body.moveTo(4,9.6f);body.lineTo(7.6f,9.6f);body.lineTo(12,5.4f);body.lineTo(12,18.6f);
+                body.lineTo(7.6f,14.4f);body.lineTo(4,14.4f);body.close();
+                glyphFill.setStyle(Paint.Style.FILL);
+                canvas.drawPath(body,glyphFill);
+                canvas.drawArc(13.4f,7f,19.4f,17f,-46f,92f,false,glyphStroke);
+                canvas.drawArc(14.6f,3.6f,22.4f,20.4f,-42f,84f,false,glyphStroke);
             }
-        }
-        private void drawSpeaker(Canvas canvas){
-            Path body=new Path();
-            body.moveTo(4,9.6f);body.lineTo(7.6f,9.6f);body.lineTo(12,5.4f);body.lineTo(12,18.6f);
-            body.lineTo(7.6f,14.4f);body.lineTo(4,14.4f);body.close();
-            cutFill.setStyle(Paint.Style.FILL);
-            canvas.drawPath(body,cutFill);
-            canvas.drawArc(13.4f,7f,19.4f,17f,-46f,92f,false,cutStroke);
-            canvas.drawArc(14.6f,3.6f,22.4f,20.4f,-42f,84f,false,cutStroke);
+            canvas.restore();
         }
     }
 
-    /** Linear 24-grid glyphs so toggles read like iOS symbols without image assets. */
+    /** Linear 24-grid glyphs so toggles read like HyperOS symbols without image assets. */
     private static final class TileIcon extends View {
-        static final int TORCH=0,ROTATE=1,DND=2,DARK=3,WIFI=4,BLUETOOTH=5,CELL=6,AIRPLANE=7,GEAR=8;
+        static final int TORCH=0,ROTATE=1,DND=2,DARK=3,WIFI=4,BLUETOOTH=5,CELL=6,AIRPLANE=7,GEAR=8,
+            CAST=9,SUN=10,SPEAKER=11,BELL=12,SCAN=13,BATTERY=14,TRANSFER=15,PREV=16,PLAY=17,NEXT=18;
         private final int type;
         private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
         private int color=0xfff2f2f7;
@@ -1032,6 +1188,87 @@ final class HomeControlPanel {
                         canvas.drawLine(12+(float)Math.cos(angle)*7.6f,12+(float)Math.sin(angle)*7.6f,
                             12+(float)Math.cos(angle)*10.6f,12+(float)Math.sin(angle)*10.6f,paint);
                     }
+                    break;
+                }
+                case CAST:{
+                    canvas.drawArc(3.5f,7f,20.5f,24f,180f,90f,false,paint);
+                    canvas.drawArc(8f,11.5f,16f,19.5f,180f,90f,false,paint);
+                    paint.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(6.4f,16.4f,1.7f,paint);
+                    break;
+                }
+                case SUN:{
+                    paint.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(12,12,3.7f,paint);
+                    paint.setStyle(Paint.Style.STROKE);
+                    for(int ray=0;ray<8;ray++){
+                        double angle=Math.toRadians(ray*45);
+                        canvas.drawLine(12+(float)Math.cos(angle)*5.6f,12+(float)Math.sin(angle)*5.6f,
+                            12+(float)Math.cos(angle)*8.1f,12+(float)Math.sin(angle)*8.1f,paint);
+                    }
+                    break;
+                }
+                case SPEAKER:{
+                    paint.setStyle(Paint.Style.FILL);
+                    Path body=new Path();
+                    body.moveTo(4,9.6f);body.lineTo(7.6f,9.6f);body.lineTo(12,5.4f);body.lineTo(12,18.6f);
+                    body.lineTo(7.6f,14.4f);body.lineTo(4,14.4f);body.close();
+                    canvas.drawPath(body,paint);
+                    canvas.drawArc(13.4f,7f,19.4f,17f,-46f,92f,false,paint);
+                    canvas.drawArc(14.6f,3.6f,22.4f,20.4f,-42f,84f,false,paint);
+                    break;
+                }
+                case BELL:{
+                    canvas.drawArc(7f,4.5f,17f,14.5f,180f,180f,false,paint);
+                    canvas.drawLine(7f,9.5f,7f,15.5f,paint);
+                    canvas.drawLine(17f,9.5f,17f,15.5f,paint);
+                    canvas.drawLine(5.5f,17.5f,18.5f,17.5f,paint);
+                    paint.setStrokeWidth(2.2f);
+                    canvas.drawLine(4.5f,3.5f,19.5f,20.5f,paint);
+                    paint.setStrokeWidth(1.7f);
+                    break;
+                }
+                case SCAN:{
+                    canvas.drawLine(3f,8f,3f,4.5f,paint);canvas.drawLine(3f,4.5f,8f,4.5f,paint);
+                    canvas.drawLine(16f,4.5f,21f,4.5f,paint);canvas.drawLine(21f,4.5f,21f,8f,paint);
+                    canvas.drawLine(21f,16f,21f,19.5f,paint);canvas.drawLine(21f,19.5f,16f,19.5f,paint);
+                    canvas.drawLine(8f,19.5f,3f,19.5f,paint);canvas.drawLine(3f,19.5f,3f,16f,paint);
+                    canvas.drawLine(4.5f,12f,19.5f,12f,paint);
+                    break;
+                }
+                case BATTERY:{
+                    canvas.drawRoundRect(7f,5f,17f,20.5f,2.5f,2.5f,paint);
+                    canvas.drawLine(10f,3f,14f,3f,paint);
+                    paint.setStyle(Paint.Style.FILL);
+                    canvas.drawRoundRect(9.2f,9f,14.8f,18.5f,1.5f,1.5f,paint);
+                    paint.setStyle(Paint.Style.STROKE);
+                    break;
+                }
+                case TRANSFER:{
+                    canvas.drawLine(8f,15.5f,8f,4.5f,paint);
+                    canvas.drawLine(5.3f,7.2f,8f,4.5f,paint);canvas.drawLine(8f,4.5f,10.7f,7.2f,paint);
+                    canvas.drawLine(16f,8.5f,16f,19.5f,paint);
+                    canvas.drawLine(13.3f,16.8f,16f,19.5f,paint);canvas.drawLine(16f,19.5f,18.7f,16.8f,paint);
+                    break;
+                }
+                case PREV:{
+                    paint.setStyle(Paint.Style.FILL);
+                    Path back=new Path();back.moveTo(17.5f,5f);back.lineTo(8.5f,12f);back.lineTo(17.5f,19f);back.close();
+                    canvas.drawPath(back,paint);
+                    canvas.drawRoundRect(5.5f,5f,8f,19f,1.2f,1.2f,paint);
+                    break;
+                }
+                case PLAY:{
+                    paint.setStyle(Paint.Style.FILL);
+                    Path play=new Path();play.moveTo(9,5f);play.lineTo(19,12f);play.lineTo(9,19f);play.close();
+                    canvas.drawPath(play,paint);
+                    break;
+                }
+                case NEXT:{
+                    paint.setStyle(Paint.Style.FILL);
+                    Path forward=new Path();forward.moveTo(6.5f,5f);forward.lineTo(15.5f,12f);forward.lineTo(6.5f,19f);forward.close();
+                    canvas.drawPath(forward,paint);
+                    canvas.drawRoundRect(16f,5f,18.5f,19f,1.2f,1.2f,paint);
                     break;
                 }
             }

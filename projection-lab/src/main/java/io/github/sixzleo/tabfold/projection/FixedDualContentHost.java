@@ -61,7 +61,9 @@ final class FixedDualContentHost implements AutoCloseable {
             inject=global.getMethod("injectInputEvent",InputEvent.class,int.class);}catch(Exception ignored){}
         SET_DISPLAY_ID=id;INPUT_MANAGER=manager;INJECT=inject;
     }
-    void touch(int displayId,MotionEvent event)throws Exception{
+    // Oneway delivery lands these on the host's binder thread pool; without the lock two
+    // threads can inject adjacent moves out of order and the drag jumps backwards.
+    synchronized void touch(int displayId,MotionEvent event)throws Exception{
         if(!displays.containsKey(displayId)||event==null||SET_DISPLAY_ID==null)return;
         MotionEvent copy=MotionEvent.obtain(event);
         try{SET_DISPLAY_ID.invoke(copy,displayId);inject(copy);}finally{copy.recycle();}
@@ -95,7 +97,9 @@ final class FixedDualContentHost implements AutoCloseable {
     }
     private void inject(InputEvent event)throws Exception{
         if(INPUT_MANAGER==null||INJECT==null)throw new IllegalStateException("Input injection unavailable");
-        INJECT.invoke(INPUT_MANAGER,event,0);
+        // Mode 2 = ASYNC: WAIT_FOR_RESULT serialized every forwarded touch on the target
+        // window's own input handling, capping finger drags at well below 60Hz.
+        INJECT.invoke(INPUT_MANAGER,event,2);
     }
     private boolean primaryRateHeld;
     // HyperOS idles the primary panel to 60Hz on static content, which also caps app vsync;

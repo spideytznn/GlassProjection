@@ -54,6 +54,7 @@ final class FixedDualOutput implements TextureView.SurfaceTextureListener,AutoCl
         main.postDelayed(this,400);
     }};
     FixedDualOutput(ProjectionService service,Display display,boolean inner,int densityOverride,FixedDualSession owner)throws Exception{
+
         this.inner=inner;this.owner=owner;physicalId=display.getDisplayId();
         Point size=new Point();display.getRealSize(size);physicalWidth=size.x;physicalHeight=size.y;
         int turn=ProjectionMath.turn(inner,display.getRotation());
@@ -72,6 +73,8 @@ final class FixedDualOutput implements TextureView.SurfaceTextureListener,AutoCl
         manager=context.getSystemService(WindowManager.class);
         root=new FrameLayout(context);root.setBackgroundColor(Color.TRANSPARENT);
         texture=new TextureView(context);texture.setOpaque(false);texture.setSurfaceTextureListener(this);
+        texture.setPivotX(0);texture.setPivotY(0);
+
         root.addView(texture,new FrameLayout.LayoutParams(width,height));
         texture.setPivotX(0);texture.setPivotY(0);
         Matrix placement=new Matrix();
@@ -80,6 +83,7 @@ final class FixedDualOutput implements TextureView.SurfaceTextureListener,AutoCl
         else if(turn==3){texture.setRotation(90);texture.setTranslationX(physicalWidth);placement.setRotate(90);placement.postTranslate(physicalWidth,0);}
         placement.invert(inverse);
         black=new View(context);black.setBackgroundColor(Color.BLACK);root.addView(black,new FrameLayout.LayoutParams(-1,-1));
+        android.util.Log.i("DuoRate","ios-timing snap build 20260920p");
         root.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
         root.setOnTouchListener((v,physicalEvent)->deliver(physicalEvent));
         WindowManager.LayoutParams p=new WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
@@ -172,7 +176,7 @@ final class FixedDualOutput implements TextureView.SurfaceTextureListener,AutoCl
         // HyperOS ramps the panel only after frames flow; an ALWAYS vote asks for 120 from the
         // first frame of a gesture instead of after the ~350ms ramp.
         surface.setFrameRate(120,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,Surface.CHANGE_FRAME_RATE_ALWAYS);
-        gpu=new FixedDualGpu(surface,width,height,contentHeight,inner,input->MobileHelper.createDualContent(input,width,contentHeight,density,inner,id->{
+        gpu=new FixedDualGpu(surface,width,height,contentHeight,inner,()->contentId>=0,input->MobileHelper.createDualContent(input,width,contentHeight,density,inner,id->{
             if(closed)return;if(id<0){owner.fail("无法创建"+(inner?"内屏":"外屏")+"桌面");return;}contentId=id;owner.contentReady();
         }),owner::fail,(direct,target)->MobileHelper.dualSurface(contentId,target));
         // Luminance sampling for pill contrast runs via PixelCopy from the view, never

@@ -13,8 +13,8 @@ final class FixedDualSession {
     private final ProjectionService service;
     private final Handler main=new Handler(Looper.getMainLooper());
     private final List<FixedDualOutput> outputs=new ArrayList<>();
-    private final FixedDualPolicy policy;
-    private final String primary;
+    private FixedDualPolicy policy;
+    private String primary;
     private boolean closed;
     private int touchedDisplay=-1;
     void touched(int id){touchedDisplay=id;}
